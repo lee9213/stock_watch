@@ -29,6 +29,45 @@ export interface SelfCheckResult {
   notify_send: boolean
 }
 
+export interface SchedulerJobInfo {
+  scheduler_name: string
+  job_id: string
+  running?: boolean
+  next_run_time: string | null
+  trigger?: string
+  label?: string
+  kind_label?: string
+  scheduler_label?: string
+  description?: string
+  schedule?: string
+  default_schedule?: string
+  enabled?: boolean
+  editable?: boolean
+  kind?: 'system' | 'agent' | 'runtime' | string
+  paused?: boolean
+  overridden?: boolean
+}
+
+export interface SchedulerJobRun {
+  id: number
+  scheduler_name: string
+  job_id: string
+  trigger_source: string
+  status: 'success' | 'failed' | 'idle' | string
+  summary: Record<string, unknown>
+  error: string
+  duration_ms: number
+  started_at: string | null
+  finished_at: string | null
+  created_at: string | null
+}
+
+export interface SchedulerPreview {
+  schedule: string
+  timezone: string
+  runs: string[]
+}
+
 export const healthApi = {
   /** 系统自检(数据源/AI/通知连通性)。notifySend=true 会真实发送测试通知。 */
   selfcheck: (notifySend = false) =>
@@ -49,4 +88,54 @@ export const healthApi = {
         notifySend,
       { timeoutMs: 30000 },
     ),
+
+  /** 可管理的调度任务列表（系统 + Agent）。 */
+  schedulerJobs: (params?: { managed?: boolean; include_agents?: boolean }) => {
+    const q = new URLSearchParams()
+    if (params?.managed === false) q.set('managed', 'false')
+    if (params?.include_agents === false) q.set('include_agents', 'false')
+    const qs = q.toString()
+    return fetchAPI<{ items: SchedulerJobInfo[] }>(
+      '/health/scheduler-jobs' + (qs ? `?${qs}` : ''),
+    )
+  },
+
+  /** 更新系统/Agent 调度。 */
+  updateSchedulerJob: (
+    scheduler: string,
+    jobId: string,
+    body: { schedule?: string; enabled?: boolean },
+  ) =>
+    fetchAPI<SchedulerJobInfo>(
+      `/health/scheduler-jobs/${encodeURIComponent(scheduler)}/${encodeURIComponent(jobId)}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
+
+  /** 预览调度表达式。 */
+  previewSchedulerSchedule: (schedule: string, count = 5) =>
+    fetchAPI<SchedulerPreview>(
+      `/health/scheduler-jobs/preview?schedule=${encodeURIComponent(schedule)}&count=${count}`,
+    ),
+
+  /** 系统调度执行历史。 */
+  schedulerRuns: (params?: {
+    scheduler?: string
+    job_id?: string
+    status?: string
+    include_idle?: boolean
+    limit?: number
+    offset?: number
+  }) => {
+    const q = new URLSearchParams()
+    if (params?.scheduler) q.set('scheduler', params.scheduler)
+    if (params?.job_id) q.set('job_id', params.job_id)
+    if (params?.status) q.set('status', params.status)
+    if (params?.include_idle) q.set('include_idle', 'true')
+    if (params?.limit != null) q.set('limit', String(params.limit))
+    if (params?.offset != null) q.set('offset', String(params.offset))
+    const qs = q.toString()
+    return fetchAPI<{ items: SchedulerJobRun[]; limit: number; offset: number }>(
+      '/health/scheduler-runs' + (qs ? `?${qs}` : ''),
+    )
+  },
 }

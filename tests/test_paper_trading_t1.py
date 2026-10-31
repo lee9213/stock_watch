@@ -124,7 +124,8 @@ def test_buy_then_later_scan_stays_locked_after_reloading_storage(monkeypatch, s
     with storage() as db:
         db.add(StrategySignalRun(stock_symbol="600519", stock_market="CN", strategy_code="trend_follow",
             snapshot_date="2026-10-09", status="active", action="buy", entry_low=9,
-            entry_high=11, stop_loss=9, target_price=12, rank_score=90))
+            entry_high=11, stop_loss=9, target_price=12, rank_score=90,
+            payload={"news_metric": {"news_count": 1, "direct_news_count": 1, "event_tier": "medium"}}))
         db.commit()
     engine = module.PaperTradingEngine()
     monkeypatch.setattr(engine, "_fetch_quotes_map", lambda pairs: {("CN", "600519"): {"current_price": 10}})

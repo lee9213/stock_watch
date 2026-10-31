@@ -1,33 +1,32 @@
 import { Suspense, useState, useEffect, useRef } from 'react'
-import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
-import { TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, Github, BellRing, Sparkles, Activity, ClipboardCheck, MessageCircle, Compass } from 'lucide-react'
-import { useTheme } from '@/hooks/use-theme'
+import { Routes, Route, useLocation, Navigate } from 'react-router-dom'
 import { appApi } from '@panwatch/api/app'
 import { fetchAPI, isAuthenticated } from '@panwatch/api/client'
-import LogsModal from '@panwatch/biz-ui/components/logs-modal'
-import AmbientBackground from '@panwatch/biz-ui/components/AmbientBackground'
-import AccountMenu from '@/components/AccountMenu'
 import { GuidedTourProvider } from '@/components/onboarding/GuidedTour'
 import AssistantOpenBridge from '@/components/AssistantOpenBridge'
 import SelfCheckModal from '@/components/SelfCheckModal'
 import { RouteErrorBoundary, RouteLoadingFallback } from '@/components/RouteBoundary'
-import { preloadRoute, routePages } from '@/router/page-loaders'
+import { routePages } from '@/router/page-loaders'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@panwatch/base-ui/components/ui/dialog'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { useTranslation } from 'react-i18next'
-import type { NavigationItemKey } from '@/i18n/resources'
-import { NotificationBell, NotificationProvider } from '@/components/notifications/NotificationProvider'
+import { NotificationProvider } from '@/components/notifications/NotificationProvider'
+import AppShell from '@/layout/AppShell'
 
 const {
   LoginPage,
   DashboardPage,
   GettingStartedPage,
   OpportunitiesPage,
+  NewsFlowPage,
   StocksPage,
   AgentsPage,
   SettingsPage,
   DataSourcesPage,
   HistoryPage,
+  SchedulerHistoryPage,
+  LogsPage,
+  TokenUsagePage,
   AnalysisDetailPage,
   PriceAlertsPage,
   PaperTradingPage,
@@ -35,34 +34,16 @@ const {
   AssistantPage,
 } = routePages
 
-const NAV_ITEMS: Array<{ to: string; icon: typeof LayoutDashboard; labelKey: NavigationItemKey }> = [
-  { to: '/', icon: LayoutDashboard, labelKey: 'home' },
-  { to: '/portfolio', icon: List, labelKey: 'portfolio' },
-  { to: '/assistant', icon: MessageCircle, labelKey: 'assistant' },
-  { to: '/opportunities', icon: Sparkles, labelKey: 'opportunities' },
-  { to: '/paper-trading', icon: Activity, labelKey: 'paperTrading' },
-  { to: '/alerts', icon: BellRing, labelKey: 'alerts' },
-  { to: '/agents', icon: Bot, labelKey: 'agents' },
-  { to: '/evaluations', icon: ClipboardCheck, labelKey: 'evaluations' },
-  { to: '/history', icon: Clock, labelKey: 'history' },
-  { to: '/datasources', icon: Database, labelKey: 'dataSources' },
-  { to: '/settings', icon: Settings, labelKey: 'settings' },
-  { to: '/getting-started', icon: Compass, labelKey: 'gettingStarted' },
-]
-
-// 认证守卫组件
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const [authState, setAuthState] = useState<'checking' | 'authenticated' | 'unauthenticated'>('checking')
   const location = useLocation()
 
   useEffect(() => {
-    // 检查本地 token
     if (isAuthenticated()) {
       setAuthState('authenticated')
       return
     }
 
-    // 没有 token，需要去登录页（设置密码或登录）
     setAuthState('unauthenticated')
   }, [])
 
@@ -82,26 +63,15 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 }
 
 function App() {
-  const { t } = useTranslation(['common', 'navigation'])
-  const { mode, setMode } = useTheme()
+  const { t } = useTranslation('common')
   const location = useLocation()
   const isAssistantRoute = location.pathname === '/assistant' || location.pathname.startsWith('/assistant/')
+  const fillHeight = isAssistantRoute || location.pathname === '/logs' || location.pathname === '/news-flow'
   const [version, setVersion] = useState('')
-  const [logsOpen, setLogsOpen] = useState(false)
   const [selfCheckOpen, setSelfCheckOpen] = useState(false)
   const [upgradeOpen, setUpgradeOpen] = useState(false)
   const [upgradeInfo, setUpgradeInfo] = useState<{ latest: string; url: string } | null>(null)
   const checkedUpdateRef = useRef(false)
-  const repoUrl = 'https://github.com/TNT-Likely/PanWatch'
-  const navItems = NAV_ITEMS.map(item => ({
-    to: item.to,
-    icon: item.icon,
-    label: t(`navigation:items.${item.labelKey}`),
-  }))
-  const desktopPrimaryNavItems = navItems.slice(0, 5)
-  const desktopMoreNavItems = navItems.slice(5)
-  const mobilePrimaryNavItems = navItems.slice(0, 5)
-  const mobileMoreNavItems = navItems.slice(5)
 
   useEffect(() => {
     appApi.version()
@@ -129,7 +99,6 @@ function App() {
       .catch(() => {})
   }, [version])
 
-  // 登录页面不显示导航
   if (location.pathname === '/login') {
     return (
       <RouteErrorBoundary>
@@ -146,214 +115,69 @@ function App() {
     <RequireAuth>
     <GuidedTourProvider>
     <NotificationProvider>
-    <div
-      className={isAssistantRoute
-        ? 'relative flex h-dvh flex-col overflow-hidden bg-background'
-        : 'min-h-screen pb-16 md:pb-0 relative overflow-x-clip bg-background'}
+    <AppShell
+      fillHeight={fillHeight}
+      onOpenSelfCheck={() => setSelfCheckOpen(true)}
     >
-      <AmbientBackground />
-      {/* Desktop Floating Nav */}
-      <div className="sticky top-0 z-50 shrink-0 px-4 md:px-6 pt-3 md:pt-4 pb-2 hidden md:block">
-        <header className="card px-4 md:px-5">
-          <div className="h-14 flex items-center justify-between">
-            {/* Logo */}
-            <NavLink to="/" className="flex items-center gap-2.5 group">
-              <div className="w-8 h-8 rounded-2xl bg-gradient-to-br from-primary to-primary/70 flex items-center justify-center shadow-sm">
-                <TrendingUp className="w-4 h-4 text-white" />
-              </div>
-              <span className="text-[15px] font-bold text-foreground">PanWatch</span>
-              {version && <span className="text-[11px] text-muted-foreground/60 font-normal">v{version}</span>}
-            </NavLink>
-
-            {/* Nav Links */}
-            <nav className="flex items-center gap-1">
-              {desktopPrimaryNavItems.map(({ to, icon: Icon, label }) => {
-                const isActive = to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
-                return (
-                  <NavLink
-                    key={to}
-                    to={to}
-                    className="relative"
-                    onMouseEnter={() => preloadRoute(to)}
-                    onFocus={() => preloadRoute(to)}
-                  >
-                    <span
-                      className={`absolute inset-0 rounded-xl transition-all ${
-                        isActive
-                          ? 'bg-[linear-gradient(135deg,hsl(var(--primary)/0.14),hsl(var(--primary)/0.04),hsl(var(--success)/0.06))] ring-1 ring-primary/20 shadow-[0_8px_24px_-18px_hsl(var(--primary)/0.55)]'
-                          : 'bg-transparent'
-                      }`}
-                    />
-                    <span
-                      className={`relative px-3.5 py-2 rounded-xl text-[13px] font-medium transition-all flex items-center gap-1.5 ${
-                        isActive
-                          ? 'text-foreground'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-accent'
-                      }`}
-                    >
-                      <Icon className={`w-4 h-4 ${isActive ? 'text-primary' : ''}`} />
-                      {label}
-                    </span>
-                  </NavLink>
-                )
-              })}
-            </nav>
-
-            {/* action wrapper:GitHub + 日志 + 头像(头像下拉含更多导航/主题色/退出) */}
-            <div className="flex items-center gap-1.5 px-1.5 py-1 rounded-2xl bg-accent/20 border border-border/40">
-              <NotificationBell />
-              <button
-                onClick={() => window.open(repoUrl, '_blank', 'noopener,noreferrer')}
-                className="w-9 h-9 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-background/70 transition-all"
-                title={t('common:links.github')}
-              >
-                <Github className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setLogsOpen(true)}
-                className="w-9 h-9 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-background/70 transition-all"
-                title={t('common:links.logs')}
-              >
-                <ScrollText className="w-4 h-4" />
-              </button>
-              <AccountMenu
-                navItems={desktopMoreNavItems}
-                mode={mode}
-                onSetMode={setMode}
-                onOpenSelfCheck={() => setSelfCheckOpen(true)}
-              />
-            </div>
-          </div>
-        </header>
-      </div>
-
-      {/* Mobile Top Bar */}
-      <div className="sticky top-0 z-50 shrink-0 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-2 md:hidden">
-        <header className="card px-4">
-          <div className="h-12 flex items-center justify-between">
-            <NavLink to="/" className="flex shrink-0 items-center gap-2 group">
-              <div className="w-7 h-7 rounded-xl bg-gradient-to-br from-primary to-primary/70 flex items-center justify-center shadow-sm">
-                <TrendingUp className="w-3.5 h-3.5 text-white" />
-              </div>
-              <span className="text-[14px] font-bold text-foreground">PanWatch</span>
-              {version && <span className="text-[10px] text-muted-foreground/60 font-normal">v{version}</span>}
-            </NavLink>
-            <div className="flex shrink-0 items-center gap-1.5 px-1.5 py-1 rounded-2xl bg-accent/20 border border-border/40">
-              <NotificationBell mobile />
-              <button
-                onClick={() => window.open(repoUrl, '_blank', 'noopener,noreferrer')}
-                className="hidden w-8 h-8 rounded-xl items-center justify-center min-[360px]:flex text-muted-foreground hover:text-foreground hover:bg-background/70 transition-all"
-                title={t('common:links.github')}
-              >
-                <Github className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setLogsOpen(true)}
-                className="w-8 h-8 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-background/70 transition-all"
-                title={t('common:links.logs')}
-              >
-                <ScrollText className="w-4 h-4" />
-              </button>
-              <AccountMenu
-                size="sm"
-                navItems={mobileMoreNavItems}
-                mode={mode}
-                onSetMode={setMode}
-                onOpenSelfCheck={() => setSelfCheckOpen(true)}
-              />
-            </div>
-          </div>
-        </header>
-      </div>
-
-      {/* Mobile Bottom Nav */}
-      <nav className="fixed bottom-0 left-0 right-0 z-50 md:hidden bg-card border-t border-border px-2 pb-[env(safe-area-inset-bottom)]">
-        <div className="flex items-center justify-around h-14">
-          {mobilePrimaryNavItems.map(({ to, icon: Icon, label }) => {
-            const isActive = to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
-            return (
-              <NavLink
-                key={to}
-                to={to}
-                onMouseEnter={() => preloadRoute(to)}
-                onFocus={() => preloadRoute(to)}
-                className={`flex flex-col items-center justify-center gap-0.5 px-2 py-1.5 rounded-xl transition-all min-w-[56px] ${
-                  isActive
-                    ? 'text-primary bg-primary/8 ring-1 ring-primary/15'
-                    : 'text-muted-foreground hover:bg-accent/30'
-                }`}
-              >
-                <Icon className="w-5 h-5" />
-                <span className="text-[10px] font-medium">{label}</span>
-              </NavLink>
-            )
-          })}
+      <AssistantOpenBridge />
+      <RouteErrorBoundary>
+        <Suspense fallback={<RouteLoadingFallback />}>
+          <Routes>
+            <Route path="/" element={<DashboardPage />} />
+            <Route path="/getting-started" element={<GettingStartedPage />} />
+            <Route path="/opportunities" element={<OpportunitiesPage />} />
+            <Route path="/news-flow" element={<NewsFlowPage />} />
+            <Route path="/portfolio" element={<StocksPage />} />
+            <Route path="/agents" element={<AgentsPage />} />
+            <Route path="/evaluations" element={<EvaluationsPage />} />
+            <Route path="/history" element={<HistoryPage />} />
+            <Route path="/scheduler-history" element={<SchedulerHistoryPage />} />
+            <Route path="/logs" element={<LogsPage />} />
+            <Route path="/token-usage" element={<TokenUsagePage />} />
+            <Route path="/paper-trading" element={<PaperTradingPage />} />
+            <Route path="/alerts" element={<PriceAlertsPage />} />
+            <Route path="/assistant" element={<AssistantPage />} />
+            <Route path="/assistant/:conversationId" element={<AssistantPage />} />
+            <Route path="/datasources" element={<DataSourcesPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/analysis/:symbol/:date" element={<AnalysisDetailPage />} />
+          </Routes>
+        </Suspense>
+      </RouteErrorBoundary>
+    </AppShell>
+    <SelfCheckModal open={selfCheckOpen} onClose={() => setSelfCheckOpen(false)} />
+    <Dialog open={upgradeOpen} onOpenChange={setUpgradeOpen}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t('update.title')}</DialogTitle>
+          <DialogDescription>
+            {t('update.description', { current: version, latest: upgradeInfo?.latest ?? '' })}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="text-[12px] text-muted-foreground">
+          {t('update.recommendation')}
         </div>
-      </nav>
-
-      {/* Content */}
-      <main
-        className={`${isAssistantRoute
-          ? 'flex min-h-0 flex-1 flex-col overflow-hidden pb-[calc(3.5rem+env(safe-area-inset-bottom))] md:pb-6'
-          : 'pb-4 md:pb-6'} px-4 pt-4 md:px-6 md:pt-6 w-full`}
-      >
-        <AssistantOpenBridge />
-        <RouteErrorBoundary>
-          <Suspense fallback={<RouteLoadingFallback />}>
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/getting-started" element={<GettingStartedPage />} />
-              <Route path="/opportunities" element={<OpportunitiesPage />} />
-              <Route path="/portfolio" element={<StocksPage />} />
-              <Route path="/agents" element={<AgentsPage />} />
-              <Route path="/evaluations" element={<EvaluationsPage />} />
-              <Route path="/history" element={<HistoryPage />} />
-              <Route path="/paper-trading" element={<PaperTradingPage />} />
-              <Route path="/alerts" element={<PriceAlertsPage />} />
-              <Route path="/assistant" element={<AssistantPage />} />
-              <Route path="/assistant/:conversationId" element={<AssistantPage />} />
-              <Route path="/datasources" element={<DataSourcesPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/analysis/:symbol/:date" element={<AnalysisDetailPage />} />
-            </Routes>
-          </Suspense>
-        </RouteErrorBoundary>
-      </main>
-      <LogsModal open={logsOpen} onOpenChange={setLogsOpen} />
-      <SelfCheckModal open={selfCheckOpen} onClose={() => setSelfCheckOpen(false)} />
-      <Dialog open={upgradeOpen} onOpenChange={setUpgradeOpen}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>{t('common:update.title')}</DialogTitle>
-            <DialogDescription>
-              {t('common:update.description', { current: version, latest: upgradeInfo?.latest ?? '' })}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="text-[12px] text-muted-foreground">
-            {t('common:update.recommendation')}
-          </div>
-          <div className="flex items-center justify-end gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => {
-                if (upgradeInfo?.latest) localStorage.setItem('panwatch_upgrade_dismissed_version', upgradeInfo.latest)
-                setUpgradeOpen(false)
-              }}
-            >
-              {t('common:actions.remindLater')}
-            </Button>
-            <Button
-              onClick={() => {
-                const url = upgradeInfo?.url || 'https://github.com/sunxiao0721/PanWatch/releases'
-                window.open(url, '_blank', 'noopener,noreferrer')
-              }}
-            >
-              {t('common:actions.upgrade')}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-    </div>
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (upgradeInfo?.latest) localStorage.setItem('panwatch_upgrade_dismissed_version', upgradeInfo.latest)
+              setUpgradeOpen(false)
+            }}
+          >
+            {t('actions.remindLater')}
+          </Button>
+          <Button
+            onClick={() => {
+              const url = upgradeInfo?.url || 'https://github.com/sunxiao0721/PanWatch/releases'
+              window.open(url, '_blank', 'noopener,noreferrer')
+            }}
+          >
+            {t('actions.upgrade')}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     </NotificationProvider>
     </GuidedTourProvider>
     </RequireAuth>

@@ -28,7 +28,7 @@ export default function FactorWeightsPanel() {
     setError('')
     try {
       const res = await factorsApi.list()
-      setItems(res.items || [])
+      setItems((res.items || []).filter((item) => item.market === 'CN'))
     } catch (e) {
       setError(e instanceof Error ? e.message : tr('loadFailed'))
       setItems([])

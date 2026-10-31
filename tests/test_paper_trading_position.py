@@ -6,9 +6,9 @@ from src.modules.paper_trading.paper_trading_engine import _compute_quantity, _p
 
 def test_position_weight_tiers():
     """信号强度越高,单笔资金占比越大(分档)。"""
-    assert _position_weight(90) == 0.25
-    assert _position_weight(80) == 0.18
-    assert _position_weight(70) == 0.12
+    assert _position_weight(90) == 0.18
+    assert _position_weight(80) == 0.14
+    assert _position_weight(70) == 0.10
     assert _position_weight(50) == 0.08
     assert _position_weight(90) > _position_weight(50)
 

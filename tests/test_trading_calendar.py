@@ -280,3 +280,11 @@ def test_上下文后验评估仅在夜间运行且不启动补跑(monkeypatch):
     fields = {field.name: str(field) for field in evaluate_job.trigger.fields}
     assert fields["hour"] == "4"
     assert fields["minute"] == "30"
+
+    close_job = jobs["context_maintenance_evaluate_cn_close"]
+    close_fields = {field.name: str(field) for field in close_job.trigger.fields}
+    assert close_fields["hour"] == "15"
+    assert close_fields["minute"] == "45"
+
+    for slot in ("0915", "1030", "1330", "1430", "2200"):
+        assert f"context_maintenance_refresh_opportunities_{slot}" in jobs

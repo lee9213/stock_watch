@@ -76,7 +76,7 @@ md.health()                                     # {vendor: {success_rate, p50_la
 | `northbound` | `*, market="CN"` | `list[NorthboundItem]` | 北向资金,**市场级**,取当日末值快照。 |
 | `index_quotes` | `tencent_symbols` | `list[dict]` | 指数行情。按**原始腾讯符号**(`sh000001`/`hkHSI`/`usDJI`…)取,不经 `Symbol.parse`(指数代码可能与个股撞号)。不经 Engine/registry。 |
 | `index_klines` | `code, *, market, days=120` | `list[Bar]` | 指数日K。仅 `INDEX_SECID`(client.py)显式映射的指数(沪深300/上证/深成指/创业板指/恒生)有数据;未映射(如美股指数)→ `[]`(fail-soft)。不经 Engine/registry。 |
-| `hot_stocks` / `hot_boards` / `board_stocks` | 见下 | `list[HotStock/HotBoard]` | 东财热门榜。**市场级、不经 Engine**(非 symbol 模型),直连 `DiscoveryVendor`。`hot_stocks(*, market="CN", mode="turnover", limit=20, proxy=None)`、`hot_boards(*, market="CN", mode="gainers", limit=12, proxy=None)`、`board_stocks(*, board_code, mode="gainers", limit=20, proxy=None)`。 |
+| `hot_stocks` / `hot_boards` / `board_stocks` | 见下 | `list[HotStock/HotBoard]` | 热门榜。**市场级、不经 Engine**(非 symbol 模型),直连 `DiscoveryVendor`,包内多源故障转移(东财 clist 多主机 → 新浪行情中心 → 同花顺热榜 → 东财人气榜)。`hot_stocks(*, market="CN", mode="turnover", limit=20, proxy=None)`、`hot_boards(*, market="CN", mode="gainers", limit=12, proxy=None)`、`board_stocks(*, board_code, mode="gainers", limit=20, proxy=None)`。 |
 | `health` | — | `dict[str, dict]` | 每个 vendor 的内存健康度快照(成功率 / p50 延迟 / 最近错误 / 样本数)。 |
 
 > `klines`/`capital_flow`/`events` **不在包内缓存**(`cache_ttl_sec=0`),缓存/节流交给宿主(PanWatch 的 collector 层有市场态感知缓存);`quotes` 有 5s 短 TTL 防抖;`flash_news` 30s、`fundamentals`/`dragon_tiger`/`margin`/`shareholders`/`dividend` 300s、`northbound` 60s(均为包内 Engine 层 TTL,详见 `client.py`)。
@@ -136,7 +136,7 @@ class SourceConfig:
 | `northbound` | `NorthboundItem` | `ths`(同花顺 hexin) | CN | **市场级**(symbols 恒空,取当日末值) |
 
 此外还有两类**不进 registry/不进 Engine**的特殊入口(市场级、非 symbol 模型,故不计入上述 11 类):
-- **discovery**(`hot_stocks`/`hot_boards`/`board_stocks`):东财热门榜,单源,直连 `DiscoveryVendor`。
+- **discovery**(`hot_stocks`/`hot_boards`/`board_stocks`):热门榜,直连 `DiscoveryVendor`;空结果或异常自动切下一源。
 - **index**(`index_quotes`/`index_klines`):指数行情/K线,`index_quotes` 走腾讯原始符号,`index_klines` 走 `INDEX_SECID` 显式映射 + 东财K线。
 
 **故障转移**:Engine 按 `ConfigProvider` 返回的 priority 顺序试 vendor,过滤 `enabled` + `supports_markets`;首个"成功且非空(kline 为 ≥`min_count`)"即返回并缓存;全失败返回空。每次取数经 `MetricsSink` 记录,`health()` 可读。

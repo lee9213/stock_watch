@@ -19,6 +19,7 @@ from src.modules.administration.api import (
     pats,
     providers,
     settings,
+    token_usage,
 )
 from src.modules.administration.api.auth import get_current_user
 from src.modules.administration.api.settings import get_app_version
@@ -108,6 +109,12 @@ app.include_router(
 )
 app.include_router(
     logs.router, prefix="/api/logs", tags=["logs"], dependencies=protected
+)
+app.include_router(
+    token_usage.router,
+    prefix="/api/token-usage",
+    tags=["token-usage"],
+    dependencies=protected,
 )
 app.include_router(
     history.router, prefix="/api", tags=["history"], dependencies=protected

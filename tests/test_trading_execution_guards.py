@@ -170,13 +170,13 @@ def test_alerts_filter_before_quotes_and_manual_non_dry_scan_cannot_bypass(monke
     assert fetch.call_args.args[0] == []
 
 
-def test_opportunity_refresh_propagates_only_eligible_markets(monkeypatch):
+def test_opportunity_refresh_skips_when_only_offshore_markets_are_open(monkeypatch):
     from src.modules.research.context_scheduler import ContextMaintenanceScheduler
     freeze(monkeypatch, datetime(2026, 10, 1, 22, tzinfo=ZoneInfo("Asia/Shanghai")))
     refresh = Mock(return_value={"count": 0})
     monkeypatch.setattr("src.modules.research.context_scheduler.refresh_strategy_signals", refresh)
     asyncio.run(ContextMaintenanceScheduler()._refresh_opportunities_job())
-    assert refresh.call_args.kwargs["markets"] == ["US"]
+    refresh.assert_not_called()
 
 
 def test_outcome_waits_for_actual_completed_bars_and_ignores_intraday_tail(monkeypatch):

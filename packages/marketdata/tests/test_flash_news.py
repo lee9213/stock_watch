@@ -228,6 +228,54 @@ def test_eastmoney_empty_response(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ths(同花顺快讯)
+# ---------------------------------------------------------------------------
+
+def test_ths_parses_flash_with_stocks(monkeypatch):
+    payload = {
+        "code": "200",
+        "data": {
+            "list": [
+                {
+                    "id": "5496997",
+                    "seq": "681177480",
+                    "title": "苹果销量同比增长",
+                    "digest": "Counterpoint 报告显示 iPhone 18 Pro 系列销量同比增 3.1%",
+                    "ctime": "1793158854",
+                    "url": "https://news.10jqka.com.cn/20261028/c681177480.shtml",
+                    "stock": [{"stockCode": "AAPL", "name": "苹果"}, {"code": "600519", "name": "贵州茅台"}],
+                },
+                {
+                    "id": "5496998",
+                    "title": "",
+                    "digest": "",
+                    "ctime": "1793158854",
+                },
+            ]
+        },
+    }
+    monkeypatch.setattr(fn, "market_get", lambda *a, **k: payload)
+    out = fn.ThsFlashNewsVendor().fetch([], {"days": 20})
+    assert len(out) == 1
+    item = out[0]
+    assert item.source == "ths"
+    assert item.external_id == "5496997"
+    assert item.title == "苹果销量同比增长"
+    assert "3.1%" in item.content
+    assert item.symbols == ["AAPL", "600519"]
+    assert item.url.endswith("c681177480.shtml")
+    assert item.publish_time == datetime.fromtimestamp(1793158854, tz=timezone.utc)
+
+
+def test_ths_empty_response(monkeypatch):
+    monkeypatch.setattr(fn, "market_get", lambda *a, **k: None)
+    assert fn.ThsFlashNewsVendor().fetch([], {}) == []
+
+    monkeypatch.setattr(fn, "market_get", lambda *a, **k: {"data": {"list": []}})
+    assert fn.ThsFlashNewsVendor().fetch([], {}) == []
+
+
+# ---------------------------------------------------------------------------
 # MarketData.flash_news() —— 走单源 Engine 出数
 # ---------------------------------------------------------------------------
 

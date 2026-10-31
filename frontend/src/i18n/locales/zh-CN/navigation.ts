@@ -1,7 +1,18 @@
 export const navigation = {
+  mainNav: '主导航',
+  collapseSidebar: '收起侧栏',
+  expandSidebar: '展开侧栏',
+  resizeSidebar: '拖动调整侧栏宽度',
+  groups: {
+    monitor: '监控',
+    invest: '投资',
+    intelligence: '智能',
+    system: '系统',
+  },
   items: {
     gettingStarted: '引导中心',
     home: '首页',
+    newsFlow: '事件驱动',
     portfolio: '持仓',
     opportunities: '机会',
     paperTrading: '模拟盘',
@@ -10,6 +21,9 @@ export const navigation = {
     agents: 'Agent',
     evaluations: '验证中心',
     history: '历史',
+    schedulerHistory: '调度管理',
+    logs: '日志',
+    tokenUsage: 'Token 统计',
     dataSources: '数据源',
     settings: '设置',
   },

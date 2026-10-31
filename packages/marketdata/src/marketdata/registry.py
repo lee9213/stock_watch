@@ -19,11 +19,13 @@ from marketdata.vendors.flash_news import (
     ClsFlashNewsVendor,
     EastmoneyFlashNewsVendor,
     SinaFlashNewsVendor,
+    ThsFlashNewsVendor,
 )
 from marketdata.vendors.kline import (
     EastmoneyKlineVendor,
     StooqKlineVendor,
     TencentKlineVendor,
+    ThsKlineVendor,
     YahooKlineVendor,
 )
 from marketdata.vendors.market_flow import (
@@ -40,6 +42,7 @@ from marketdata.vendors.news import (
 from marketdata.vendors.northbound import HexinNorthboundVendor
 from marketdata.vendors.sina import SinaQuoteVendor
 from marketdata.vendors.tencent import TencentQuoteVendor
+from marketdata.vendors.ths import ThsQuoteVendor
 from marketdata.vendors.yfinance import YFinanceQuoteVendor
 
 # 各数据类型 → {vendor name: vendor 类}。注意:vendor 的 import 本身是廉价的
@@ -49,12 +52,14 @@ VENDOR_CLASSES_BY_TYPE: dict[str, dict[str, type]] = {
         "tencent": TencentQuoteVendor,
         "sina": SinaQuoteVendor,
         "eastmoney": EastmoneyQuoteVendor,
+        "ths": ThsQuoteVendor,
         "yfinance": YFinanceQuoteVendor,
     },
     "kline": {
         "tencent": TencentKlineVendor,
         "stooq": StooqKlineVendor,
         "eastmoney": EastmoneyKlineVendor,
+        "ths": ThsKlineVendor,
         "yahoo": YahooKlineVendor,
     },
     "capital_flow": {
@@ -72,6 +77,7 @@ VENDOR_CLASSES_BY_TYPE: dict[str, dict[str, type]] = {
         "cls": ClsFlashNewsVendor,
         "sina": SinaFlashNewsVendor,
         "eastmoney": EastmoneyFlashNewsVendor,
+        "ths": ThsFlashNewsVendor,
     },
     "news": {
         "xueqiu": XueqiuNewsVendor,

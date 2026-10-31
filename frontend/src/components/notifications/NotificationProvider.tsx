@@ -18,7 +18,15 @@ const Context = createContext({ unread: 0, pending: 0, active: 0, tasks: [] as A
   monitor: null as ReturnType<typeof useNotifications> | null, open: () => {}, openTasks: () => {}, openItem: async (_item: NotificationItem) => {} })
 export function useActiveAssistantTasks() { return useContext(Context).tasks }
 const foreground = () => document.visibilityState === 'visible' && document.hasFocus()
-export function NotificationBell({ mobile = false }: { mobile?: boolean }) {
+export function NotificationBell({
+  mobile = false,
+  previewSide,
+  previewAlign = 'end',
+}: {
+  mobile?: boolean
+  previewSide?: 'top' | 'right' | 'bottom' | 'left'
+  previewAlign?: 'start' | 'center' | 'end'
+}) {
   const { unread, pending, active, disconnected, monitor, open, openTasks, openItem } = useContext(Context)
   const { pathname } = useLocation()
   const onAssistantPage = pathname === '/assistant' || pathname.startsWith('/assistant/')
@@ -59,7 +67,7 @@ export function NotificationBell({ mobile = false }: { mobile?: boolean }) {
       {unread > 0 && <span data-testid="notification-badge" aria-hidden className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-0.5 text-[9px] text-primary-foreground">{unread > 99 ? '99+' : unread}</span>}
       {unread === 0 && pending > 0 && <span aria-label={t('notifications.pending') as string} className="absolute right-0 top-0 h-1.5 w-1.5 rounded-full bg-primary" />}
     </button></PopoverTrigger>
-      <PopoverContent ref={previewRef} data-testid="notification-preview" align="end" sideOffset={8} collisionPadding={8} onMouseEnter={keepPreviewOpen} onMouseLeave={closeAfterHover} onOpenAutoFocus={event => { if (openedByHover.current) event.preventDefault() }} onCloseAutoFocus={event => { if (handingOff.current || openedByHover.current) event.preventDefault() }} className="w-[min(23rem,calc(100vw-1rem))] overflow-hidden p-0 shadow-xl">
+      <PopoverContent ref={previewRef} data-testid="notification-preview" side={previewSide} align={previewAlign} sideOffset={8} collisionPadding={8} onMouseEnter={keepPreviewOpen} onMouseLeave={closeAfterHover} onOpenAutoFocus={event => { if (openedByHover.current) event.preventDefault() }} onCloseAutoFocus={event => { if (handingOff.current || openedByHover.current) event.preventDefault() }} className="w-[min(23rem,calc(100vw-1rem))] overflow-hidden p-0 shadow-xl">
         <Suspense fallback={<p role="status" className="p-4 text-[12px]">{t('notifications.loading')}</p>}>
           {monitor && <NotificationInbox monitor={monitor} onHistory={() => { handingOff.current = true; setPreviewOpen(false); handoffTimer.current = setTimeout(open, 0) }} onOpen={async item => { handingOff.current = true; setPreviewOpen(false); await openItem(item) }} />}
         </Suspense>

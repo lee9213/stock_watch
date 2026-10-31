@@ -29,6 +29,7 @@ from src.platform.ai.ai_failover import build_failover_client
 from src.platform.notifications.notifier import NotifierManager
 from src.modules.automation.agent_scheduler import AgentScheduler
 from src.modules.market.price_alert_scheduler import PriceAlertScheduler
+from src.modules.market.news_flow_scheduler import NewsFlowScheduler
 from src.modules.paper_trading.paper_trading_scheduler import PaperTradingScheduler
 from src.modules.research.context_scheduler import ContextMaintenanceScheduler
 from src.modules.automation.agent_runs import record_agent_run
@@ -52,6 +53,7 @@ scheduler: AgentScheduler | None = None
 price_alert_scheduler: PriceAlertScheduler | None = None
 paper_trading_scheduler: PaperTradingScheduler | None = None
 context_maintenance_scheduler: ContextMaintenanceScheduler | None = None
+news_flow_scheduler: NewsFlowScheduler | None = None
 
 
 def apply_proxy_env(proxy: str | None) -> None:
@@ -263,27 +265,11 @@ def setup_playwright():
         logger.error(f"Playwright 安装失败: {e}")
 
 
-def seed_sample_stocks():
-    """首次启动时添加示例股票"""
-    db = SessionLocal()
-    try:
-        # 只在没有任何股票时才添加示例
-        if db.query(Stock).count() > 0:
-            return
+def seed_table_comments():
+    """把各表中文用途说明写入 schema_table_comments，供 Navicat 查阅。"""
+    from src.platform.persistence.table_comments import seed_table_comments as _seed
 
-        samples = [
-            {"symbol": "600519", "name": "贵州茅台", "market": "CN"},
-            {"symbol": "002594", "name": "比亚迪", "market": "CN"},
-            {"symbol": "300750", "name": "宁德时代", "market": "CN"},
-            {"symbol": "00700", "name": "腾讯控股", "market": "HK"},
-            {"symbol": "AAPL", "name": "苹果", "market": "US"},
-        ]
-        for s in samples:
-            db.add(Stock(**s))
-        db.commit()
-        logger.info("已添加 5 只示例股票（首次启动）")
-    finally:
-        db.close()
+    _seed()
 
 
 def seed_agents():
@@ -398,6 +384,19 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "test_symbols": list(DEFAULT_TEST_SYMBOLS),
         },
         {
+            "name": "同花顺 K线",
+            "type": "kline",
+            "provider": "ths",
+            "config": {
+                "description": "同花顺 d.10jqka 日线(CN,免 key)。"
+                "作腾讯/东财之后的 A 股第三源;last.js + 按年片补历史。"
+            },
+            "enabled": True,
+            "priority": 8,  # 腾讯(0) → 东财(5) 之后
+            "supports_batch": False,
+            "test_symbols": list(DEFAULT_TEST_SYMBOLS),
+        },
+        {
             "name": "Stooq K线",
             "type": "kline",
             "provider": "stooq",
@@ -467,6 +466,19 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "test_symbols": list(DEFAULT_TEST_SYMBOLS),
         },
         {
+            "name": "同花顺行情",
+            "type": "quote",
+            "provider": "ths",
+            "config": {
+                "description": "同花顺 d.10jqka realhead 实时行情(CN,免 key)。"
+                "作腾讯/东财之后的 A 股第三源。"
+            },
+            "enabled": True,
+            "priority": 6,  # 腾讯(0) → 东财(3) 之后
+            "supports_batch": False,  # realhead 单只查询,逐只
+            "test_symbols": list(DEFAULT_TEST_SYMBOLS),
+        },
+        {
             "name": "Sina 行情",
             "type": "quote",
             "provider": "sina",
@@ -527,6 +539,19 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "config": {"description": "东财 np-weblist 7×24 资讯,与财联社互备。"},
             "enabled": True,
             "priority": 10,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        {
+            "name": "同花顺7x24快讯",
+            "type": "flash_news",
+            "provider": "ths",
+            "config": {
+                "description": "同花顺 tapp/news/push/stock 7×24 快讯(免 key),"
+                "与事件驱动新闻流同源;作财联社/新浪/东财之后的备源。"
+            },
+            "enabled": True,
+            "priority": 15,
             "supports_batch": False,
             "test_symbols": [],
         },
@@ -734,6 +759,77 @@ def seed_strategies():
     logger.info("策略目录初始化完成")
 
 
+def _merge_paper_watchlist(db, result: list[StockConfig]) -> list[StockConfig]:
+    """盘中监测把模拟盘持仓也纳入，避免只扫关注池。"""
+    from src.platform.persistence.models import PaperTradingPosition
+
+    seen = {(item.market, item.symbol) for item in result}
+    rows = (
+        db.query(PaperTradingPosition)
+        .filter(PaperTradingPosition.status == "open")
+        .all()
+    )
+    for pos in rows:
+        try:
+            market = MarketCode((pos.stock_market or "CN").strip().upper() or "CN")
+        except ValueError:
+            market = MarketCode.CN
+        key = (market, pos.stock_symbol)
+        if not pos.stock_symbol or key in seen:
+            continue
+        result.append(
+            StockConfig(
+                symbol=pos.stock_symbol,
+                name=pos.stock_name or pos.stock_symbol,
+                market=market,
+            )
+        )
+        seen.add(key)
+    return result
+
+
+def _paper_portfolio_account(db):
+    from src.modules.automation.base import AccountInfo, PositionInfo
+    from src.platform.persistence.models import PaperTradingAccount, PaperTradingPosition
+
+    account = db.query(PaperTradingAccount).first()
+    rows = (
+        db.query(PaperTradingPosition)
+        .filter(PaperTradingPosition.status == "open")
+        .all()
+    )
+    if account is None or not rows:
+        return None
+    positions = []
+    for pos in rows:
+        try:
+            market = MarketCode((pos.stock_market or "CN").strip().upper() or "CN")
+        except ValueError:
+            market = MarketCode.CN
+        entry = float(pos.entry_price or 0.0)
+        qty = int(pos.quantity or 0)
+        positions.append(
+            PositionInfo(
+                account_id=-1,
+                account_name="模拟盘",
+                stock_id=0,
+                symbol=pos.stock_symbol,
+                name=pos.stock_name or pos.stock_symbol,
+                market=market,
+                cost_price=entry,
+                quantity=qty,
+                invested_amount=entry * qty,
+                trading_style="swing",
+            )
+        )
+    return AccountInfo(
+        id=-1,
+        name="模拟盘",
+        available_funds=float(account.current_capital or 0.0),
+        positions=positions,
+    )
+
+
 def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
     """从数据库加载某个 Agent 关联的自选股"""
     db = SessionLocal()
@@ -743,6 +839,8 @@ def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
         )
         stock_ids = [sa.stock_id for sa in stock_agents]
         if not stock_ids:
+            if agent_name == "intraday_monitor":
+                return _merge_paper_watchlist(db, [])
             return []
 
         # 绑定优先：只要绑定了 Agent，就纳入执行范围
@@ -761,6 +859,8 @@ def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
                     asset_type=s.asset_type,
                 )
             )
+        if agent_name == "intraday_monitor":
+            result = _merge_paper_watchlist(db, result)
         return result
     finally:
         db.close()
@@ -778,6 +878,10 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
         )
         stock_ids = set(sa.stock_id for sa in stock_agents)
         if not stock_ids:
+            if agent_name == "intraday_monitor":
+                paper_acc = _paper_portfolio_account(db)
+                if paper_acc is not None:
+                    return PortfolioInfo(accounts=[paper_acc])
             return PortfolioInfo()
 
         # 获取所有启用的账户
@@ -829,6 +933,10 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
                 )
             )
 
+        if agent_name == "intraday_monitor":
+            paper_acc = _paper_portfolio_account(db)
+            if paper_acc is not None:
+                account_infos.append(paper_acc)
         return PortfolioInfo(accounts=account_infos)
     finally:
         db.close()
@@ -1505,7 +1613,7 @@ async def lifespan(app):
     except Exception as e:
         logger.warning(f"数据源对账失败,跳过(不阻断启动): {e}")
     seed_strategies()
-    seed_sample_stocks()
+    seed_table_comments()
 
     # 启动时回填历史 TradingAgents 决策到建议池(stock_suggestions)
     # 早期 TA 运行没写建议池,这次启动一次性补齐,让「AI 建议」面板能看到。
@@ -1536,7 +1644,7 @@ async def lifespan(app):
     except Exception as e:
         logger.warning(f"交易日历预热调度失败: {e}")
 
-    global scheduler, price_alert_scheduler, paper_trading_scheduler, context_maintenance_scheduler
+    global scheduler, price_alert_scheduler, paper_trading_scheduler, context_maintenance_scheduler, news_flow_scheduler
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("Agent 调度器已启动")
@@ -1573,6 +1681,13 @@ async def lifespan(app):
         logger.info("上下文维护调度器已启动")
     except Exception as e:
         logger.error(f"上下文维护调度器启动失败: {e}")
+    try:
+        settings = Settings()
+        news_flow_scheduler = NewsFlowScheduler(timezone=settings.app_timezone)
+        news_flow_scheduler.start()
+        logger.info("事件驱动调度器已启动")
+    except Exception as e:
+        logger.error(f"事件驱动调度器启动失败: {e}")
     # MCP 调用日志保留期清理:每日 04:00 清理超期审计记录
     try:
         register_mcp_log_cleanup(scheduler)
@@ -1596,6 +1711,9 @@ async def lifespan(app):
         if context_maintenance_scheduler:
             context_maintenance_scheduler.shutdown()
             logger.info("上下文维护调度器已关闭")
+        if news_flow_scheduler:
+            news_flow_scheduler.shutdown()
+            logger.info("事件驱动调度器已关闭")
 
 
 # 模块级 app 实例，供 uvicorn reload 使用
@@ -1630,7 +1748,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=8000,
+        port=8888,
         reload=_dev_reload,
         reload_dirs=["src", "."] if _dev_reload else None,
         reload_excludes=["data/*", "frontend/*", ".claude/*"] if _dev_reload else None,

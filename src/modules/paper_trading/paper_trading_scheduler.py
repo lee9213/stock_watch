@@ -10,14 +10,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.modules.paper_trading.paper_trading_engine import ENGINE
 from src.platform.scheduling import trading_calendar as calendar
 from src.platform.scheduling.exchange_calendar_data import EARLY_CLOSES
+from src.platform.scheduling.job_runs import track_job_run
 from src.platform.marketdata.models import MARKETS, MarketCode
 
 logger = logging.getLogger(__name__)
 
+# 模拟盘定时任务仅覆盖 A 股（港股/美股盘前与日终任务不再注册）。
+PAPER_SCHEDULE_MARKETS: tuple[MarketCode, ...] = (MarketCode.CN,)
+
 
 def _any_market_trading() -> bool:
-    """CN/HK/US 任一在交易时段即为 True。全休市时行情不动,扫描可跳过(行为中性)。"""
-    for m in (MarketCode.CN, MarketCode.HK, MarketCode.US):
+    """关注市场任一在交易时段即为 True。全休市时行情不动,扫描可跳过(行为中性)。"""
+    for m in PAPER_SCHEDULE_MARKETS:
         md = MARKETS.get(m)
         if md and md.is_trading_time():
             return True
@@ -39,19 +43,31 @@ class PaperTradingScheduler:
             return
         self._running = True
         try:
-            result = await ENGINE.scan_once()
-            opened = result.get("opened", 0)
-            closed = result.get("closed", 0)
-            status = result.get("status", "?")
-            # 有实际开/平仓才是业务事件,否则只是心跳。
-            level = logging.INFO if (opened or closed) else logging.DEBUG
-            logger.log(
-                level,
-                "[模拟盘] 扫描完成: opened=%s closed=%s status=%s",
-                opened,
-                closed,
-                status,
-            )
+            with track_job_run(
+                "paper_trading", "paper_trading_scan", persist_idle=False
+            ) as summary:
+                result = await ENGINE.scan_once()
+                opened = int(result.get("opened", 0) or 0)
+                closed = int(result.get("closed", 0) or 0)
+                status = result.get("status", "?")
+                summary["opened"] = opened
+                summary["closed"] = closed
+                summary["status"] = status
+                if result.get("error"):
+                    summary["error"] = str(result.get("error"))[:500]
+                if status == "error":
+                    raise RuntimeError(str(result.get("error") or "paper_trading_scan_error"))
+                if not opened and not closed:
+                    summary["_idle"] = True
+                # 有实际开/平仓才是业务事件,否则只是心跳。
+                level = logging.INFO if (opened or closed) else logging.DEBUG
+                logger.log(
+                    level,
+                    "[模拟盘] 扫描完成: opened=%s closed=%s status=%s",
+                    opened,
+                    closed,
+                    status,
+                )
         except Exception as e:
             logger.exception(f"[模拟盘] 扫描异常: {e}")
         finally:
@@ -98,9 +114,11 @@ class PaperTradingScheduler:
             coalesce=True,
             max_instances=1,
         )
-        # Built-in paper notifications use each exchange's local clock. Agent
-        # schedules and the configured scan interval are deliberately unchanged.
-        for code, definition in MARKETS.items():
+        # 盘前/日终通知按交易所本地时钟；当前仅注册 A 股。
+        for code in PAPER_SCHEDULE_MARKETS:
+            definition = MARKETS.get(code)
+            if not definition:
+                continue
             self.scheduler.add_job(
                 self._premarket_job, "cron", hour=9, minute=0,
                 timezone=definition.timezone, args=[code.value],
@@ -119,8 +137,26 @@ class PaperTradingScheduler:
                 )
         self.scheduler.start()
         from src.platform.scheduling.scheduler_registry import register
+        from src.platform.scheduling.job_manager import apply_configs_to_scheduler
         register("paper_trading", self.scheduler)
-        logger.info(f"模拟盘调度器已启动，扫描间隔 {self.interval_seconds}s")
+        apply_configs_to_scheduler("paper_trading", self.scheduler, timezone=str(self.scheduler.timezone))
+        # 清理历史残留的港股/美股盘前与日终任务（若仍挂在调度器上）
+        for job in list(self.scheduler.get_jobs()):
+            jid = str(getattr(job, "id", "") or "")
+            if jid.startswith("paper_trading_premarket_") or jid.startswith("paper_trading_summary_"):
+                if not any(jid.endswith(f"_{m.value}") or f"_{m.value}_" in jid for m in PAPER_SCHEDULE_MARKETS):
+                    # premarket_HK / summary_HK_HHMM / premarket_US / summary_US_*
+                    if "_HK" in jid or jid.endswith("_HK") or "_US" in jid or jid.endswith("_US"):
+                        try:
+                            self.scheduler.remove_job(jid)
+                            logger.info("[模拟盘] 已移除港股/美股任务: %s", jid)
+                        except Exception:
+                            pass
+        logger.info(
+            "模拟盘调度器已启动，扫描间隔 %ss，通知市场=%s",
+            self.interval_seconds,
+            ",".join(m.value for m in PAPER_SCHEDULE_MARKETS),
+        )
 
     def shutdown(self):
         try:

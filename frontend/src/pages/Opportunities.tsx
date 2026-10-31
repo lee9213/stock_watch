@@ -65,7 +65,7 @@ const formatMetric = (value: unknown, digits = 1) => {
 }
 
 const DEFAULT_FILTERS = {
-  market: 'ALL' as const,
+  market: 'CN' as const,
   source: 'all' as const,
   holding: 'unheld' as const,
   strategy: 'all',
@@ -218,7 +218,7 @@ export default function OpportunitiesPage() {
   const [strategyCatalog, setStrategyCatalog] = useState<StrategyCatalogItem[]>([])
   const [watchlist, setWatchlist] = useState<Set<string>>(new Set())
 
-  const [market, setMarket] = useLocalStorage<'ALL' | 'CN' | 'HK' | 'US'>('panwatch_opportunities_market_v3', DEFAULT_FILTERS.market)
+  const [market, setMarket] = useLocalStorage<'ALL' | 'CN'>('panwatch_opportunities_market_v4', DEFAULT_FILTERS.market)
   const [source, setSource] = useLocalStorage<SourceFilter>('panwatch_opportunities_source_v3', DEFAULT_FILTERS.source)
   const [holding, setHolding] = useLocalStorage<HoldingFilter>('panwatch_opportunities_holding_v3', DEFAULT_FILTERS.holding)
   const [strategy, setStrategy] = useLocalStorage('panwatch_opportunities_strategy_v3', DEFAULT_FILTERS.strategy)
@@ -422,7 +422,7 @@ export default function OpportunitiesPage() {
 
   const groupedItems = useMemo<GroupedSignal[]>(() => {
     const grouped = new Map<string, { primary: StrategySignalItem; members: StrategySignalItem[] }>()
-    for (const row of items) {
+    for (const row of items.filter((x) => (x.stock_market || 'CN') === 'CN')) {
       const key = `${row.stock_market || 'CN'}:${row.stock_symbol}`
       const prev = grouped.get(key)
       if (!prev) {
@@ -489,7 +489,7 @@ export default function OpportunitiesPage() {
   }, [stats])
 
   const regimeSummary = useMemo(() => {
-    return (stats?.regimes || []).map((r) => ({
+    return (stats?.regimes || []).filter((r) => r.market === 'CN').map((r) => ({
       market: r.market,
       label: oppT(`opportunities.regimes.${r.regime || 'neutral'}`, { defaultValue: r.regime || 'neutral' }),
       regime: r.regime || 'neutral',
@@ -499,7 +499,7 @@ export default function OpportunitiesPage() {
   }, [stats, t])
 
   const riskSummary = useMemo(() => {
-    return (stats?.portfolio_risk || []).map((r) => ({
+    return (stats?.portfolio_risk || []).filter((r) => r.market === 'CN').map((r) => ({
       market: r.market,
       riskLevel: r.risk_level || 'medium',
       concentration: Number(r.concentration_top5 || 0),
@@ -614,13 +614,11 @@ export default function OpportunitiesPage() {
 
       <div data-tour="opportunity-filters" className="card p-3 md:p-4 mb-4">
         <div className="grid grid-cols-2 md:grid-cols-8 gap-2">
-          <Select value={market} onValueChange={(v) => setMarket(v as 'ALL' | 'CN' | 'HK' | 'US')}>
+          <Select value={market === 'ALL' || market === 'CN' ? market : 'CN'} onValueChange={(v) => setMarket(v as 'ALL' | 'CN')}>
             <SelectTrigger className="h-8 text-[12px]"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="ALL">{oppT('opportunities.markets.ALL')}</SelectItem>
               <SelectItem value="CN">{oppT('opportunities.markets.CN')}</SelectItem>
-              <SelectItem value="HK">{oppT('opportunities.markets.HK')}</SelectItem>
-              <SelectItem value="US">{oppT('opportunities.markets.US')}</SelectItem>
             </SelectContent>
           </Select>
           <Select value={source} onValueChange={(v) => setSource(v as SourceFilter)}>

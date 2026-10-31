@@ -22,6 +22,7 @@ from src.platform.persistence.models import (
     EntryCandidate,
     EntryCandidateOutcome,
     MarketScanSnapshot,
+    PaperTradingPosition,
     Position,
     Stock,
     StockSuggestion,
@@ -558,17 +559,70 @@ def _strategy_labels(tags: list[str] | None) -> list[str]:
     return out
 
 
-def _plan_quality(plan: dict | None) -> int:
+# 涨幅过热硬阈值（%）——达到后不再给 buy/add active
+OVERHEAT_CHANGE_PCT = 9.5
+# 热榜至少有这么多活数据时，不再用历史/种子蓝筹补位
+LIVE_SCAN_FALLBACK_MIN = 1
+# 当日大跌硬阈值（%）——跌幅达到后不再给 buy/add active（日 K 技术标签反映的是昨天，接不住今天的下跌）
+CRASH_CHANGE_PCT = -7.0
+# A 股买入最低成交额（元）；低于此值视为薄票，不给 buy/add
+MIN_TURNOVER_FOR_BUY = 80_000_000.0
+# 日 K 多头/金叉必须叠加当日盘口，否则只是昨天的形态
+INTRADAY_CONFIRM_TAGS = frozenset({"momentum", "volume_breakout", "pullback"})
+INTRADAY_CONFIRM_CHANGE_PCT = 1.5
+INTRADAY_CONFIRM_VOLUME_RATIO = 1.2
+# 入场区间相对现价的合理宽度上下限
+_PLAN_BAND_WIDTH_MIN = 0.002  # 0.2%
+_PLAN_BAND_WIDTH_MAX = 0.08   # 8%
+# 计划中轴相对现价最大偏离倍数
+_PLAN_MID_PRICE_RATIO_MAX = 1.5
+
+
+def _plan_quality(plan: dict | None, *, quote: dict | None = None) -> int:
+    """计划完整度 + 结构合理性。结构不合法时封顶 <90，避免误进 active。"""
     p = plan if isinstance(plan, dict) else {}
     score = 0
-    if _safe_float(p.get("entry_low")) is not None or _safe_float(p.get("entry_high")) is not None:
+    entry_low = _safe_float(p.get("entry_low"))
+    entry_high = _safe_float(p.get("entry_high"))
+    stop_loss = _safe_float(p.get("stop_loss"))
+    target_price = _safe_float(p.get("target_price"))
+
+    if entry_low is not None or entry_high is not None:
         score += 30
-    if _safe_float(p.get("stop_loss")) is not None:
+    if stop_loss is not None:
         score += 30
-    if _safe_float(p.get("target_price")) is not None:
+    if target_price is not None:
         score += 30
     if str(p.get("invalidation") or "").strip():
         score += 10
+
+    structural_ok = True
+    if entry_low is not None and entry_high is not None:
+        if entry_low <= 0 or entry_high <= 0 or entry_low > entry_high:
+            structural_ok = False
+        else:
+            mid = (entry_low + entry_high) / 2.0
+            width = (entry_high - entry_low) / mid if mid > 0 else 0.0
+            if width < _PLAN_BAND_WIDTH_MIN or width > _PLAN_BAND_WIDTH_MAX:
+                structural_ok = False
+            if stop_loss is not None and stop_loss >= mid:
+                structural_ok = False
+            if target_price is not None and target_price <= mid:
+                structural_ok = False
+            price = _safe_float((quote or {}).get("current_price"))
+            if price is not None and price > 0 and mid > 0:
+                ratio = max(price / mid, mid / price)
+                if ratio > _PLAN_MID_PRICE_RATIO_MAX:
+                    structural_ok = False
+    elif entry_low is None and entry_high is None:
+        # 无入场区间时不做结构否决（观望类可无区间）
+        pass
+    else:
+        structural_ok = False
+
+    if not structural_ok:
+        # 保证达不到 active 门槛（quality >= 90）
+        score = min(score, 89)
     return int(_clamp(float(score), 0, 100))
 
 
@@ -580,11 +634,22 @@ def _load_holding_keys() -> set[str]:
             .join(Position, Position.stock_id == Stock.id)
             .all()
         )
-        return {
+        keys = {
             f"{(m or 'CN').strip().upper()}:{(s or '').strip()}"
             for m, s in rows
             if s
         }
+        paper_rows = (
+            db.query(PaperTradingPosition.stock_market, PaperTradingPosition.stock_symbol)
+            .filter(PaperTradingPosition.status == "open")
+            .all()
+        )
+        for market, symbol in paper_rows:
+            code = (symbol or "").strip()
+            if not code:
+                continue
+            keys.add(f"{(market or 'CN').strip().upper()}:{code}")
+        return keys
     finally:
         db.close()
 
@@ -625,12 +690,76 @@ def _pick_close_on_or_before(klines: list, target: date) -> float | None:
     return None
 
 
-def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict:
+def normalize_stock_name(name: str | None) -> str:
+    """去掉名称里的空格/全角空格，便于新闻匹配（五 粮 液 → 五粮液）。"""
+    if not name:
+        return ""
+    return (
+        str(name)
+        .replace(" ", "")
+        .replace("\u3000", "")
+        .replace("\xa0", "")
+        .strip()
+    )
+
+
+def cn_limit_pct(symbol: str | None) -> float:
+    """A 股涨跌停幅度：主板 10、创业/科创 20、北交 30。"""
+    code = (symbol or "").strip()
+    if code.startswith("688") or code.startswith(("300", "301")):
+        return 20.0
+    if code.startswith(("8", "4")) or code.startswith("92"):
+        return 30.0
+    return 10.0
+
+
+def overheat_change_pct(symbol: str | None) -> float:
+    """过热阈值：涨停幅度减 0.5 个百分点。"""
+    return cn_limit_pct(symbol) - 0.5
+
+
+def _kline_unavailable(kline: dict | None) -> bool:
+    """采集失败或日 K 不够用：不能据此打回避。"""
+    k = kline or {}
+    if k.get("error"):
+        return True
+    trend = (k.get("trend") or "").strip()
+    macd = (k.get("macd_cross") or "").strip()
+    return (not trend or trend == "数据不足") and not macd
+
+
+def has_intraday_confirm(
+    strategy_tags: list[str] | None,
+    quote: dict | None = None,
+    kline: dict | None = None,
+) -> bool:
+    """日 K 多头/金叉之外，还要有当日动量、放量或回踩，或涨幅+量比同时达标。"""
+    tags = {str(x) for x in (strategy_tags or []) if x}
+    if tags & INTRADAY_CONFIRM_TAGS:
+        return True
+    q = quote or {}
+    k = kline or {}
+    pct = _safe_float(q.get("change_pct"))
+    vol_ratio = _safe_float(k.get("volume_ratio"))
+    if vol_ratio is None:
+        vol_ratio = _safe_float(q.get("volume_ratio"))
+    return (
+        pct is not None
+        and pct >= float(INTRADAY_CONFIRM_CHANGE_PCT)
+        and vol_ratio is not None
+        and vol_ratio >= float(INTRADAY_CONFIRM_VOLUME_RATIO)
+    )
+
+
+def _derive_market_scan_decision(
+    quote: dict | None, kline: dict | None, *, symbol: str = ""
+) -> dict:
     q = quote or {}
     k = kline or {}
     points = 0
     tags: list[str] = []
     reasons: list[str] = []
+    heat_line = overheat_change_pct(symbol)
 
     trend = (k.get("trend") or "").strip()
     if trend == "多头排列":
@@ -648,23 +777,34 @@ def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict
     elif macd == "死叉":
         points -= 2
 
+    pct = _safe_float(q.get("change_pct"))
     vol_ratio = _safe_float(k.get("volume_ratio"))
     if vol_ratio is not None:
-        if vol_ratio >= 1.8:
+        if vol_ratio >= 1.8 and (pct is None or pct > 0):
             points += 1
             tags.append("volume_breakout")
             reasons.append(f"放量({vol_ratio:.1f}x)")
         elif vol_ratio <= 0.7:
             points -= 1
 
-    pct = _safe_float(q.get("change_pct"))
+    turnover = _safe_float(q.get("turnover"))
+    thin_tape = turnover is not None and turnover < float(MIN_TURNOVER_FOR_BUY)
+    if thin_tape:
+        points -= 2
+        reasons.append(f"成交额过低({turnover / 1e8:.2f}亿)")
+    overheated = pct is not None and pct >= float(heat_line)
+    crashed = pct is not None and pct <= float(CRASH_CHANGE_PCT)
     if pct is not None:
-        if 1.5 <= pct <= 8.5:
+        if overheated:
+            points -= 3
+            reasons.append(f"涨幅过热({pct:+.2f}%)")
+        elif crashed:
+            points -= 3
+            reasons.append(f"当日大跌({pct:+.2f}%)")
+        elif 1.5 <= pct <= 8.5:
             points += 1
             tags.append("momentum")
             reasons.append(f"涨幅{pct:+.2f}%")
-        elif pct >= 10.5:
-            points -= 2
         elif pct <= -5.5:
             points += 1
             tags.append("rebound")
@@ -679,15 +819,34 @@ def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict
 
     action = "watch"
     action_label = "观望"
-    if points >= 4:
+    if overheated:
+        action = "watch"
+        action_label = "过热观望"
+    elif crashed:
+        action = "watch"
+        action_label = "大跌观望"
+    elif thin_tape:
+        action = "watch"
+        action_label = "流动性观望"
+    elif points >= 3 and not has_intraday_confirm(tags, q, k):
+        action = "watch"
+        action_label = "盘中未确认"
+        reasons.append("日K形态缺少当日盘口确认")
+    elif points >= 4:
         action = "buy"
         action_label = "建仓"
     elif points >= 3:
         action = "add"
         action_label = "准备加仓"
     elif points <= -3:
-        action = "avoid"
-        action_label = "回避"
+        if _kline_unavailable(k):
+            action = "watch"
+            action_label = "K线不足"
+            reasons.append("日K未取到，不按回避处理")
+        else:
+            # 空头+死叉只是没有买点，不是风险回避
+            action = "watch"
+            action_label = "形态偏弱"
 
     signal = "，".join(_strategy_labels(tags[:3])) if tags else "暂无明确信号"
     reason = "，".join(reasons[:3]) if reasons else "等待更高确定性信号后介入"
@@ -702,7 +861,12 @@ def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict
 
 
 def _score_market_scan_candidate(
-    *, action: str, quote: dict | None, kline: dict | None, strategy_tags: list[str] | None
+    *,
+    action: str,
+    quote: dict | None,
+    kline: dict | None,
+    strategy_tags: list[str] | None,
+    symbol: str = "",
 ) -> tuple[float, list[str]]:
     score = ACTION_BASE_SCORE.get((action or "").strip().lower(), 45.0)
     evidence: list[str] = []
@@ -717,12 +881,12 @@ def _score_market_scan_candidate(
 
     pct = _safe_float(q.get("change_pct"))
     if pct is not None:
-        if 1 <= pct <= 7:
+        if pct >= float(overheat_change_pct(symbol)):
+            score -= 8
+            evidence.append(f"涨幅过热({pct:+.2f}%)")
+        elif 1 <= pct <= 7:
             score += 2
             evidence.append(f"价格动量({pct:+.2f}%)")
-        elif pct >= 10:
-            score -= 3
-            evidence.append(f"涨幅过热({pct:+.2f}%)")
 
     turnover = _safe_float(q.get("turnover"))
     if turnover is not None:
@@ -813,12 +977,13 @@ def _load_market_scan_history_inputs(
             "reason": (row.reason or "").strip(),
             "strategy_tags_seed": list(row.strategy_tags or []),
             "plan_seed": row.plan if isinstance(row.plan, dict) else {},
-            "meta": {
-                "source": "market_scan_history",
-                "fallback_snapshot_date": row.snapshot_date,
-                "fallback_candidate_id": row.id,
-                "fallback_status": row.status or "",
-            },
+                "meta": {
+                    "source": "market_scan_history",
+                    "fill_source": "history",
+                    "fallback_snapshot_date": row.snapshot_date,
+                    "fallback_candidate_id": row.id,
+                    "fallback_status": row.status or "",
+                },
         }
         if len(out) >= int(limit):
             break
@@ -873,6 +1038,7 @@ def _load_market_scan_snapshot_inputs(
             "quote_seed": quote_seed,
             "meta": {
                 "source": "market_scan_snapshot",
+                "fill_source": "snapshot",
                 "fallback_snapshot_date": row.snapshot_date,
                 "fallback_score_seed": _safe_float(row.score_seed),
                 "fallback_source": row.source or "market_scan",
@@ -925,6 +1091,7 @@ def _load_market_scan_seed_inputs(*, market: str, limit: int) -> dict[str, dict]
             "quote_seed": quote,
             "meta": {
                 "source": "market_scan_seed_universe",
+                "fill_source": "seed",
                 "collected_at": to_iso_with_tz(utc_now()),
             },
         }
@@ -975,21 +1142,60 @@ def _merge_market_scan_seed(
     return added
 
 
+def _is_st_name(name: str | None) -> bool:
+    """ST / *ST / S*ST 等风险警示股。"""
+    return "ST" in normalize_stock_name(name).upper()
+
+
+def _is_crash_change(change_pct: float | None) -> bool:
+    """热榜采集：当日大跌票直接丢掉，不占扫描名额。"""
+    return change_pct is not None and change_pct <= float(CRASH_CHANGE_PCT)
+
+
+_CN_LIST_PREFIXES = (
+    "000",
+    "001",
+    "002",
+    "003",
+    "300",
+    "301",
+    "600",
+    "601",
+    "603",
+    "605",
+    "688",
+    "689",
+    "8",
+    "4",
+    "92",
+)
+
+
+def is_cn_list_symbol(symbol: str | None) -> bool:
+    """A 股/北交所 6 位数字代码。过滤热榜备源里的 0.920306 这类脏码。"""
+    code = (symbol or "").strip()
+    if not code.isdigit() or len(code) != 6:
+        return False
+    return code.startswith(_CN_LIST_PREFIXES)
+
+
 def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] | None = None) -> dict[str, dict]:
     collector = EastMoneyDiscoveryCollector(
         proxy=_resolve_market_scan_proxy(),
     )
     result: dict[str, dict] = {}
     safe_limit = max(20, int(limit_per_market))
-    min_required = min(max(12, int(safe_limit * 0.55)), safe_limit)
 
-    for market in (("CN", "HK", "US") if markets is None else markets):
+    from src.modules.strategy.opportunity_markets import OPPORTUNITY_MARKETS
+
+    for market in (OPPORTUNITY_MARKETS if markets is None else markets):
+        fetch_limit = min(100, safe_limit + 30)
         try:
             turnover = _run_async(
                 collector.fetch_hot_stocks(
                     market=market,
                     mode="turnover",
-                    limit=safe_limit,
+                    limit=fetch_limit,
                 )
             )
         except Exception as e:
@@ -1000,7 +1206,7 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
                 collector.fetch_hot_stocks(
                     market=market,
                     mode="gainers",
-                    limit=safe_limit,
+                    limit=fetch_limit,
                 )
             )
         except Exception as e:
@@ -1008,17 +1214,27 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
             gainers = []
 
         merged = list(turnover or []) + list(gainers or [])
+        if not merged:
+            logger.warning("市场扫描热榜全空: market=%s，将回退历史/快照/种子", market)
+        dropped_crash = 0
+        dropped_junk = 0
         for row in merged:
             symbol = (getattr(row, "symbol", "") or "").strip()
             if not symbol:
                 continue
-            key = f"{market}:{symbol}"
             quote = {
                 "current_price": _safe_float(getattr(row, "price", None)),
                 "change_pct": _safe_float(getattr(row, "change_pct", None)),
                 "turnover": _safe_float(getattr(row, "turnover", None)),
                 "volume": _safe_float(getattr(row, "volume", None)),
             }
+            if _is_crash_change(quote.get("change_pct")):
+                dropped_crash += 1
+                continue
+            if market == "CN" and not is_cn_list_symbol(symbol):
+                dropped_junk += 1
+                continue
+            key = f"{market}:{symbol}"
             if key in result:
                 exist_quote = result[key].get("quote_seed") or {}
                 if _safe_float(exist_quote.get("turnover")) is None and quote.get("turnover") is not None:
@@ -1035,14 +1251,19 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
                 "quote_seed": quote,
                 "meta": {
                     "source": "market_scan",
+                    "fill_source": "live",
                     "collected_at": to_iso_with_tz(utc_now()),
                 },
             }
             if len([k for k in result if k.startswith(f"{market}:")]) >= safe_limit:
                 break
+        if dropped_crash:
+            logger.info("市场扫描剔除当日大跌: market=%s dropped=%s", market, dropped_crash)
+        if dropped_junk:
+            logger.info("市场扫描剔除脏代码: market=%s dropped=%s", market, dropped_junk)
 
         market_count = len([k for k in result if k.startswith(f"{market}:")])
-        if market_count < min_required:
+        if market_count < int(LIVE_SCAN_FALLBACK_MIN):
             fallback_map = _load_market_scan_history_inputs(
                 market=market,
                 limit=max(0, safe_limit - market_count),
@@ -1063,7 +1284,7 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
                 )
 
         market_count = len([k for k in result if k.startswith(f"{market}:")])
-        if market_count < min_required:
+        if market_count < int(LIVE_SCAN_FALLBACK_MIN):
             snapshot_map = _load_market_scan_snapshot_inputs(
                 market=market,
                 limit=max(0, safe_limit - market_count),
@@ -1084,7 +1305,7 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
                 )
 
         market_count = len([k for k in result if k.startswith(f"{market}:")])
-        if market_count < min_required:
+        if market_count < int(LIVE_SCAN_FALLBACK_MIN):
             seed_map = _load_market_scan_seed_inputs(
                 market=market,
                 limit=max(0, safe_limit - market_count),
@@ -1103,8 +1324,14 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
                     len([k for k in result if k.startswith(f"{market}:")]),
                 )
 
+    st_keys = [k for k, v in result.items() if _is_st_name(v.get("stock_name"))]
+    for key in st_keys:
+        result.pop(key, None)
+    if st_keys:
+        logger.info("市场扫描剔除 ST: %s 只", len(st_keys))
+
     # Final per-market cap and stable ordering.
-    for market in (("CN", "HK", "US") if markets is None else markets):
+    for market in (OPPORTUNITY_MARKETS if markets is None else markets):
         keys = [k for k in result.keys() if k.startswith(f"{market}:")]
         if len(keys) <= safe_limit:
             continue
@@ -1259,13 +1486,15 @@ def refresh_entry_candidates(
     max_kline_symbols: int = 72,
     markets: list[str] | None = None,
 ) -> dict:
+    from src.modules.strategy.opportunity_markets import resolve_opportunity_markets
+
     snapshot = (snapshot_date or date.today().strftime("%Y-%m-%d")).strip()
+    markets = resolve_opportunity_markets(markets)
     if markets == []:
         return {"snapshot_date": snapshot, "count": 0, "items": []}
     suggestions = _load_latest_suggestions(limit=max_inputs)
-    if markets is not None:
-        suggestions = [s for s in suggestions if s.stock_market in markets]
-    scan_kwargs = {"markets": markets} if markets is not None else {}
+    suggestions = [s for s in suggestions if s.stock_market in markets]
+    scan_kwargs = {"markets": markets}
     market_scan_map = _load_market_scan_inputs(limit_per_market=max(20, int(market_scan_limit)), **scan_kwargs)
     _persist_market_scan_snapshot(snapshot, market_scan_map, **scan_kwargs)
     holding_keys = _load_holding_keys()
@@ -1384,10 +1613,30 @@ def refresh_entry_candidates(
     db = SessionLocal()
     items: list[dict] = []
     try:
-        db.query(EntryCandidate).filter(
-            EntryCandidate.snapshot_date == snapshot,
-            EntryCandidate.stock_market.in_(markets) if markets is not None else True,
-        ).delete(synchronize_session=False)
+        # 按 (symbol, market, snapshot) upsert，保留稳定 id，避免删建后 SQLite 复用 id 引发串票。
+        existing_rows = (
+            db.query(EntryCandidate)
+            .filter(
+                EntryCandidate.snapshot_date == snapshot,
+                EntryCandidate.stock_market.in_(markets) if markets is not None else True,
+            )
+            .all()
+        )
+        existing_by_key: dict[str, EntryCandidate] = {}
+        for row in existing_rows:
+            ek = f"{(row.stock_market or 'CN').strip()}:{(row.stock_symbol or '').strip()}"
+            if ek in existing_by_key and row.id and existing_by_key[ek].id:
+                # 同键重复时丢掉较旧行
+                prev = existing_by_key[ek]
+                prev_ts = prev.updated_at.timestamp() if prev.updated_at else 0.0
+                row_ts = row.updated_at.timestamp() if row.updated_at else 0.0
+                drop = row if row_ts < prev_ts else prev
+                keep = prev if drop is row else row
+                existing_by_key[ek] = keep
+                db.delete(drop)
+            else:
+                existing_by_key[ek] = row
+        touched_keys: set[str] = set()
 
         for key, inp in input_map.items():
             market, symbol = key.split(":", 1)
@@ -1425,7 +1674,9 @@ def refresh_entry_candidates(
                     strategy_tags.append("volume_breakout")
             else:
                 seeded_action = (inp.get("action") or "").strip().lower()
-                decision = _derive_market_scan_decision(quote=quote, kline=kline)
+                decision = _derive_market_scan_decision(
+                    quote=quote, kline=kline, symbol=symbol
+                )
                 if seeded_action in ACTION_BASE_SCORE:
                     action = seeded_action
                     action_label = (inp.get("action_label") or decision.get("action_label") or "观望").strip()
@@ -1455,16 +1706,21 @@ def refresh_entry_candidates(
                     quote=quote,
                     kline=kline,
                     strategy_tags=strategy_tags,
+                    symbol=symbol,
                 )
 
-            if is_holding and action == "buy":
+            if is_holding and action in ("buy", "add"):
                 action = "add"
-                action_label = "准备加仓"
+                action_label = "持有/加仓"
             if (not is_holding) and action == "add":
                 action = "buy"
                 action_label = "建仓"
 
             strategy_tags = list(dict.fromkeys([x for x in strategy_tags if x]))
+            change_pct = _safe_float(quote.get("change_pct"))
+            # 放量只在当日上涨时算突破；下跌放量是出货，不打 volume_breakout
+            if change_pct is not None and change_pct <= 0:
+                strategy_tags = [x for x in strategy_tags if x != "volume_breakout"]
             plan = _build_plan(
                 action=action,
                 quote=quote,
@@ -1472,7 +1728,7 @@ def refresh_entry_candidates(
                 suggestion_meta=(inp.get("meta") or {}),
             )
             seed_plan = inp.get("plan_seed") if isinstance(inp.get("plan_seed"), dict) else {}
-            if seed_plan and _plan_quality(plan) < 90:
+            if seed_plan and _plan_quality(plan, quote=quote) < 90:
                 merged = dict(seed_plan)
                 for k, v in (plan or {}).items():
                     if v is None:
@@ -1481,61 +1737,102 @@ def refresh_entry_candidates(
                         continue
                     merged[k] = v
                 plan = merged
-            quality = _plan_quality(plan)
+            quality = _plan_quality(plan, quote=quote)
             confidence = round(score / 100.0, 3)
+
+            # 过热/大跌/薄票硬否决：即使上游 seed 给了 buy，也不进 active
+            veto = None
+            turnover = _safe_float(quote.get("turnover"))
+            if change_pct is not None and change_pct >= float(overheat_change_pct(symbol)):
+                veto = ("过热观望", f"涨幅过热({change_pct:+.2f}%)")
+            elif change_pct is not None and change_pct <= float(CRASH_CHANGE_PCT):
+                veto = ("大跌观望", f"当日大跌({change_pct:+.2f}%)")
+            elif turnover is not None and turnover < float(MIN_TURNOVER_FOR_BUY):
+                veto = ("流动性观望", f"成交额过低({turnover / 1e8:.2f}亿)")
+            elif not has_intraday_confirm(strategy_tags, quote, kline):
+                veto = ("盘中未确认", "日K形态缺少当日盘口确认")
+            fill_source = str((inp.get("meta") or {}).get("fill_source") or "live")
+            if fill_source != "live" and action in ("buy", "add"):
+                veto = ("补位观望", "历史/种子补位不作为买入机会")
+            if veto and action in ("buy", "add"):
+                action = "watch"
+                action_label = veto[0]
+                evidence = list(evidence or [])
+                if veto[1] not in evidence:
+                    evidence.append(veto[1])
 
             status = "inactive"
             threshold = 62 if candidate_source in ("market_scan", "mixed") else 55
             if action in ("buy", "add") and quality >= 90 and score >= threshold:
                 status = "active"
 
-            row = EntryCandidate(
-                stock_symbol=symbol,
-                stock_market=market,
-                stock_name=(inp.get("stock_name") or symbol).strip(),
-                snapshot_date=snapshot,
-                status=status,
-                score=score,
-                confidence=confidence,
-                action=action,
-                action_label=action_label,
-                signal=signal,
-                reason=reason,
-                candidate_source=candidate_source,
-                strategy_tags=to_jsonable(strategy_tags),
-                is_holding_snapshot=bool(is_holding),
-                plan_quality=quality,
-                entry_low=_safe_float(plan.get("entry_low")),
-                entry_high=_safe_float(plan.get("entry_high")),
-                stop_loss=_safe_float(plan.get("stop_loss")),
-                target_price=_safe_float(plan.get("target_price")),
-                invalidation=str(plan.get("invalidation") or ""),
-                source_agent=(inp.get("source_agent") or ""),
-                source_suggestion_id=inp.get("source_suggestion_id"),
-                source_trace_id=str(inp.get("source_trace_id") or ""),
-                evidence=to_jsonable(evidence),
-                plan=to_jsonable(plan),
-                meta=to_jsonable(
-                    {
-                        "candidate_source": candidate_source,
-                        "quote": quote,
-                        "kline": {
-                            "trend": kline.get("trend"),
-                            "macd_cross": kline.get("macd_cross"),
-                            "rsi_status": kline.get("rsi_status"),
-                            "kdj_status": kline.get("kdj_status"),
-                            "volume_ratio": kline.get("volume_ratio"),
-                            "support": kline.get("support"),
-                            "resistance": kline.get("resistance"),
-                        },
-                        "strategy_tags": strategy_tags,
-                        "is_holding_snapshot": bool(is_holding),
-                        "source_meta": inp.get("meta") or {},
-                    }
-                ),
+            row = existing_by_key.get(key)
+            if row is None:
+                row = EntryCandidate(
+                    stock_symbol=symbol,
+                    stock_market=market,
+                    snapshot_date=snapshot,
+                )
+                db.add(row)
+                existing_by_key[key] = row
+
+            row.stock_symbol = symbol
+            row.stock_market = market
+            row.stock_name = (inp.get("stock_name") or symbol).strip()
+            row.snapshot_date = snapshot
+            row.status = status
+            row.score = score
+            row.confidence = confidence
+            row.action = action
+            row.action_label = action_label
+            row.signal = signal
+            row.reason = reason
+            row.candidate_source = candidate_source
+            row.strategy_tags = to_jsonable(strategy_tags)
+            row.is_holding_snapshot = bool(is_holding)
+            row.plan_quality = quality
+            row.entry_low = _safe_float(plan.get("entry_low"))
+            row.entry_high = _safe_float(plan.get("entry_high"))
+            row.stop_loss = _safe_float(plan.get("stop_loss"))
+            row.target_price = _safe_float(plan.get("target_price"))
+            row.invalidation = str(plan.get("invalidation") or "")
+            row.source_agent = (inp.get("source_agent") or "")
+            row.source_suggestion_id = inp.get("source_suggestion_id")
+            row.source_trace_id = str(inp.get("source_trace_id") or "")
+            row.evidence = to_jsonable(evidence)
+            row.plan = to_jsonable(plan)
+            row.meta = to_jsonable(
+                {
+                    "candidate_source": candidate_source,
+                    "fill_source": fill_source,
+                    "quote": quote,
+                    "kline": {
+                        "trend": kline.get("trend"),
+                        "macd_cross": kline.get("macd_cross"),
+                        "rsi_status": kline.get("rsi_status"),
+                        "kdj_status": kline.get("kdj_status"),
+                        "volume_ratio": kline.get("volume_ratio"),
+                        "support": kline.get("support"),
+                        "resistance": kline.get("resistance"),
+                    },
+                    "strategy_tags": strategy_tags,
+                    "is_holding_snapshot": bool(is_holding),
+                    "source_meta": inp.get("meta") or {},
+                }
             )
-            db.add(row)
+            row.updated_at = utc_now()
+            touched_keys.add(key)
             items.append(_format_candidate_row(row))
+
+        stale_ids = [
+            int(row.id)
+            for ek, row in existing_by_key.items()
+            if row.id is not None and ek not in touched_keys
+        ]
+        if stale_ids:
+            db.query(EntryCandidate).filter(EntryCandidate.id.in_(stale_ids)).delete(
+                synchronize_session=False
+            )
 
         db.commit()
     except Exception as e:
@@ -1586,9 +1883,12 @@ def list_entry_candidates(
                 return "", []
 
             q = db.query(EntryCandidate).filter(EntryCandidate.snapshot_date == snapshot)
-            mkt = (market or "").strip().upper()
-            if mkt:
-                q = q.filter(EntryCandidate.stock_market == mkt)
+            from src.modules.strategy.opportunity_markets import resolve_opportunity_market_query
+
+            allowed = resolve_opportunity_market_query(market)
+            if allowed is None:
+                return snapshot, []
+            q = q.filter(EntryCandidate.stock_market.in_(allowed))
             st = (status or "").strip().lower()
             if st and st != "all":
                 q = q.filter(EntryCandidate.status == st)

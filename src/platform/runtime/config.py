@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # SSL 证书（企业环境）
     ca_cert_file: str = ""
 
+    # TuShare（盘前简报 index_daily / daily / news）
+    tushare_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("TUSHARE_TOKEN", "tushare_token"),
+    )
+
     # 调度
     # day_of_week 使用 POSIX cron 语义(1-5=周一到周五)
     daily_report_cron: str = "30 15 * * 1-5"

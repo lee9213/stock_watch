@@ -199,6 +199,48 @@ class AgentRun(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class SchedulerJobConfig(Base):
+    """系统调度任务配置覆盖（页面可改；启动时/热更新时应用）。"""
+
+    __tablename__ = "scheduler_job_configs"
+    __table_args__ = (
+        UniqueConstraint("scheduler_name", "job_id", name="uq_scheduler_job_config"),
+        Index("ix_scheduler_job_configs_scheduler", "scheduler_name"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scheduler_name = Column(String, nullable=False, default="")
+    job_id = Column(String, nullable=False, default="")
+    schedule_expr = Column(String, nullable=False, default="")
+    enabled = Column(Boolean, default=True)
+    label = Column(String, default="")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SchedulerJobRun(Base):
+    """系统调度任务执行历史（新闻流/机会刷新/模拟盘/后验等）。"""
+
+    __tablename__ = "scheduler_job_runs"
+    __table_args__ = (
+        Index("ix_scheduler_job_runs_created", "created_at"),
+        Index("ix_scheduler_job_runs_scheduler_job", "scheduler_name", "job_id", "created_at"),
+        Index("ix_scheduler_job_runs_status_created", "status", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scheduler_name = Column(String, nullable=False, default="")
+    job_id = Column(String, nullable=False, default="")
+    trigger_source = Column(String, default="schedule")  # schedule / manual
+    status = Column(String, nullable=False, default="success")  # success / failed / idle
+    summary = Column(JSON, default=dict)
+    error = Column(Text, default="")
+    duration_ms = Column(Integer, default=0)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class LogEntry(Base):
     __tablename__ = "log_entries"
     __table_args__ = (
@@ -250,23 +292,102 @@ class DataSource(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
-class NewsCache(Base):
-    """新闻缓存（用于去重）"""
+class MarketNews(Base):
+    """市场新闻流（事件驱动页）：同花顺 / 华尔街见闻 / 证券之星入库，可再经 LLM 摘要。"""
 
-    __tablename__ = "news_cache"
+    __tablename__ = "market_news"
     __table_args__ = (
-        UniqueConstraint("source", "external_id", name="uq_news_source_external"),
+        UniqueConstraint("news_md5", name="uq_market_news_md5"),
+        Index("ix_market_news_time", "news_time"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    source = Column(String, nullable=False)  # "cls" / "eastmoney"
-    external_id = Column(String, nullable=False)  # 来源侧 ID
-    title = Column(String, nullable=False)
-    content = Column(String, default="")
-    publish_time = Column(DateTime, nullable=False)
-    symbols = Column(JSON, default=[])  # 关联股票代码列表
-    importance = Column(Integer, default=0)  # 0-3 重要性
+    digest = Column(Text, nullable=False)
+    raw_text = Column(Text, default="")
+    title_key = Column(String, default="", index=True)
+    tags = Column(JSON, default=list)
+    relation_level = Column(Integer, default=0)
+    relation_reason = Column(Text, default="")
+    bullish_level = Column(Integer, default=0)
+    bullish_level_reason = Column(Text, default="")
+    relations_stocks = Column(JSON, default=list)
+    news_time = Column(DateTime, nullable=False)
+    news_type = Column(String, default="news")
+    news_md5 = Column(String, nullable=False)
+    sources = Column(String, default="ths")
+    url = Column(String, default="")
+    analyzed = Column(Integer, default=0)
+    analyze_fail_count = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class MarketNewsDiscard(Base):
+    """分析后判为中性而删除的新闻去重键；防止下一轮采集把同一条再入库、再分析。"""
+
+    __tablename__ = "market_news_discards"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    news_md5 = Column(String, nullable=False, unique=True, index=True)
+    url = Column(String, default="", index=True)
+    title_key = Column(String, default="", index=True)
+    news_time = Column(DateTime, nullable=True)
+    discarded_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class NewsDigest(Base):
+    """事件驱动页顶部 AI 速览快照。"""
+
+    __tablename__ = "news_digest"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    generated_at = Column(DateTime, nullable=False, index=True)
+    window_start = Column(DateTime, nullable=False)
+    window_end = Column(DateTime, nullable=False)
+    news_count = Column(Integer, default=0)
+    title = Column(String, default="")
+    headlines = Column(JSON, default=list)
+    highlights = Column(JSON, default=list)
+    model = Column(String, default="")
+    trigger_type = Column(String, default="auto")
+    input_hash = Column(String, default="")
+
+
+class LlmTokenUsage(Base):
+    """每次 LLM 调用的 token 消耗与输入输出摘要（对齐 AlphaLom llm_token_usage）。"""
+
+    __tablename__ = "llm_token_usage"
+    __table_args__ = (
+        Index("ix_llm_token_usage_created_at", "created_at"),
+        Index("ix_llm_token_usage_scene", "scene"),
+        Index("ix_llm_token_usage_model", "model"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True)
+    scene = Column(String(64), nullable=True)
+    platform = Column(String(64), nullable=True)
+    model = Column(String(128), nullable=False, default="")
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    input_text = Column(Text, nullable=True)
+    output_text = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "scene": self.scene,
+            "platform": self.platform,
+            "model": self.model,
+            "prompt_tokens": int(self.prompt_tokens or 0),
+            "completion_tokens": int(self.completion_tokens or 0),
+            "total_tokens": int(self.total_tokens or 0),
+            "input_text": self.input_text,
+            "output_text": self.output_text,
+            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M:%S") if self.created_at else None,
+        }
 
 
 class NotifyThrottle(Base):
@@ -1473,3 +1594,14 @@ class MCPCallLog(Base):
     duration_ms = Column(Integer, default=0)
     client_ip = Column(String, nullable=True)
     called_at = Column(DateTime, server_default=func.now())
+
+
+class SchemaTableComment(Base):
+    """各业务表的中文用途说明（SQLite 无原生表 COMMENT，供查库使用）。"""
+
+    __tablename__ = "schema_table_comments"
+
+    table_name = Column(String, primary_key=True)
+    category = Column(String, nullable=False, default="")
+    comment = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

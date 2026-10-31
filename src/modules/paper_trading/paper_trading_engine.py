@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from functools import wraps
 from threading import RLock
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,77 @@ from src.modules.paper_trading.paper_settlement import (
 
 logger = logging.getLogger(__name__)
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+# 入场门禁：够格才自动开仓（可用环境变量覆盖）
+MIN_RANK_SCORE_FOR_ENTRY = _env_float("PAPER_MIN_RANK_SCORE", 75.0)
+REQUIRE_NEWS_CATALYST = _env_bool("PAPER_REQUIRE_NEWS", True)
+# 新闻偏向下限：低于此值视为利空，不算催化
+MIN_EVENT_BIAS_FOR_ENTRY = _env_float("PAPER_MIN_EVENT_BIAS", 0.0)
+MAX_ENTRIES_PER_SCAN = max(1, _env_int("PAPER_MAX_ENTRIES_PER_SCAN", 2))
+# 同时持仓只数上限
+MAX_OPEN_POSITIONS = max(1, _env_int("PAPER_MAX_OPEN_POSITIONS", 6))
+# 持仓成本合计占初始资金的上限
+MAX_TOTAL_EXPOSURE = _env_float("PAPER_MAX_TOTAL_EXPOSURE", 0.50)
+# 同板块（主题/上市板）最多持仓只数
+MAX_POSITIONS_PER_SECTOR = max(1, _env_int("PAPER_MAX_POSITIONS_PER_SECTOR", 2))
+# 平仓后多少个交易日内不再买同一只（0=不限制）
+REENTRY_COOLDOWN_SESSIONS = max(0, _env_int("PAPER_REENTRY_COOLDOWN_SESSIONS", 2))
+# 收盘前多少分钟起不再新开仓
+ENTRY_CUTOFF_MINUTES = max(0, _env_int("PAPER_ENTRY_CUTOFF_MINUTES", 15))
+# 当日首个交易时段开盘后多少分钟内不新开仓
+ENTRY_OPEN_DELAY_MINUTES = max(0, _env_int("PAPER_ENTRY_OPEN_DELAY_MINUTES", 30))
+# 止盈至少为止损距离的倍数
+MIN_RR_RATIO = _env_float("PAPER_MIN_RR_RATIO", 1.5)
+# 现价相对入场中轴最大偏离（串票/脏计划防护，默认 3 倍）
+MAX_ENTRY_PLAN_PRICE_RATIO = _env_float("PAPER_MAX_ENTRY_PLAN_RATIO", 3.0)
+# 入场区间相对容差（默认 ±1%）
+ENTRY_BAND_TOLERANCE = _env_float("PAPER_ENTRY_BAND_TOLERANCE", 0.01)
+# 信号快照最多允许落后几个交易日（0=仅当日，1=当日+上一交易日）
+MAX_SIGNAL_AGE_SESSIONS = max(0, _env_int("PAPER_MAX_SIGNAL_AGE_SESSIONS", 1))
+# A 股最低成交额（元）；港股/美股单独下限。缺报价不拦。
+MIN_TURNOVER_CN = _env_float("PAPER_MIN_TURNOVER_CN", 80_000_000.0)
+MIN_TURNOVER_HK = _env_float("PAPER_MIN_TURNOVER_HK", 8_000_000.0)
+MIN_TURNOVER_US = _env_float("PAPER_MIN_TURNOVER_US", 5_000_000.0)
+# 止损距买入价的允许区间（比例）；无效止损用默认值
+STOP_MIN_PCT = _env_float("PAPER_STOP_MIN_PCT", 0.03)
+STOP_MAX_PCT = _env_float("PAPER_STOP_MAX_PCT", 0.10)
+STOP_DEFAULT_PCT = _env_float("PAPER_STOP_DEFAULT_PCT", 0.08)
+# 止盈距买入价的允许区间（比例）；无效止盈用默认值
+TARGET_MIN_PCT = _env_float("PAPER_TARGET_MIN_PCT", 0.05)
+TARGET_MAX_PCT = _env_float("PAPER_TARGET_MAX_PCT", 0.30)
+TARGET_DEFAULT_PCT = _env_float("PAPER_TARGET_DEFAULT_PCT", 0.15)
+
 # The scheduler and manual requests share one cash account in the server process.
 # Serialize reads and writes together so concurrent scans cannot spend one balance twice.
 ACCOUNT_LOCK = RLock()
@@ -49,23 +121,121 @@ COST_MODEL = CostModel()
 # 建仓股数下限(A股一手)
 FIXED_QUANTITY = 100
 
-# 移动止损:浮盈超过 MIN_PROFIT_FOR_TRAILING 后启用,从持仓最高价回撤超 TRAILING_STOP_PCT 即离场
-MIN_PROFIT_FOR_TRAILING = 0.05
-TRAILING_STOP_PCT = 0.10
-# 时间止损:无 signal.holding_days 时的默认最大持有自然日
-DEFAULT_TIME_STOP_DAYS = 20
+# 移动止损:浮盈超过 MIN_PROFIT_FOR_TRAILING 后启用,从持仓最高价回撤超 TRAILING_STOP_PCT 即离场,
+# 且离场线不低于买入价(保本)。机会盘更早启动、回撤更紧。
+MIN_PROFIT_FOR_TRAILING = _env_float("PAPER_TRAILING_MIN_PROFIT", 0.03)
+TRAILING_STOP_PCT = _env_float("PAPER_TRAILING_STOP_PCT", 0.04)
+# 时间止损:默认最多持有交易日，并与信号 holding_days 取较小值
+DEFAULT_TIME_STOP_DAYS = max(1, _env_int("PAPER_TIME_STOP_DAYS", 5))
+# 最新信号变成这些动作时按反转离场(看空信号一律 inactive,故不按状态过滤)
+REVERSAL_ACTIONS = ("avoid", "sell", "reduce")
 
 
 def _position_weight(rank_score: float) -> float:
     """按信号强度分配单笔资金占该市场预算的比例(rank_score 越高投越多)。"""
     s = float(rank_score or 0.0)
     if s >= 85:
-        return 0.25
-    if s >= 75:
         return 0.18
+    if s >= 75:
+        return 0.14
     if s >= 65:
-        return 0.12
+        return 0.10
     return 0.08
+
+
+def entry_window_open(market: str) -> bool:
+    """当前是否还允许新开仓：开盘缓冲之后、尾盘截止之前。"""
+    from src.platform.scheduling.trading_calendar import _now_in_market_tz, trading_sessions
+
+    now = _now_in_market_tz(market)
+    sessions = trading_sessions(market, now)
+    if not sessions:
+        return False
+    first_open = datetime.combine(now.date(), sessions[0].start, tzinfo=now.tzinfo)
+    if now < first_open + timedelta(minutes=ENTRY_OPEN_DELAY_MINUTES):
+        return False
+    close_at = datetime.combine(now.date(), sessions[-1].end, tzinfo=now.tzinfo)
+    return now < close_at - timedelta(minutes=ENTRY_CUTOFF_MINUTES)
+
+
+def trailing_stop_line(entry_price: float, highest_price: float) -> float | None:
+    """浮盈达标后的移动止损线（不低于买入价）；未达标返回 None。"""
+    if entry_price <= 0 or highest_price <= 0:
+        return None
+    if (highest_price - entry_price) / entry_price < MIN_PROFIT_FOR_TRAILING:
+        return None
+    return max(entry_price, highest_price * (1 - TRAILING_STOP_PCT))
+
+
+def trading_days_held(market: str, opened_at: datetime, now: datetime) -> int:
+    """买入日之后到今天（含）经过的交易日数，按市场本地日历。"""
+    from src.platform.scheduling.trading_calendar import _market_tz, is_trading_day
+
+    tz = _market_tz(market)
+    opened = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
+    start = opened.astimezone(tz).date()
+    end = now.astimezone(tz).date()
+    held = 0
+    cursor = start + timedelta(days=1)
+    while cursor <= end:
+        if is_trading_day(market, cursor):
+            held += 1
+        cursor += timedelta(days=1)
+    return held
+
+
+def clamp_exit_levels(
+    entry_price: float,
+    stop_loss: float | None,
+    target_price: float | None,
+) -> tuple[float, float]:
+    """把止损/止盈限制在买入价的合理距离内，返回 (stop_loss, target_price)。"""
+    entry = float(entry_price)
+    if stop_loss is None or stop_loss <= 0 or stop_loss >= entry:
+        stop_dist = STOP_DEFAULT_PCT
+    else:
+        stop_dist = min(max((entry - stop_loss) / entry, STOP_MIN_PCT), STOP_MAX_PCT)
+    if target_price is None or target_price <= entry:
+        target_gain = TARGET_DEFAULT_PCT
+    else:
+        target_gain = min(max((target_price - entry) / entry, TARGET_MIN_PCT), TARGET_MAX_PCT)
+    min_target = stop_dist * float(MIN_RR_RATIO)
+    if target_gain < min_target:
+        target_gain = min(min_target, TARGET_MAX_PCT)
+    return round(entry * (1 - stop_dist), 4), round(entry * (1 + target_gain), 4)
+
+
+def lot_size(symbol: str, market: str = "CN") -> int:
+    """A 股科创板 200 股一手，其余默认 100。"""
+    if (market or "CN").strip().upper() == "CN" and str(symbol or "").startswith("688"):
+        return 200
+    return FIXED_QUANTITY
+
+
+def industry_bucket(symbol: str, name: str | None = None) -> str:
+    """粗分主题/上市板，用于同板块持仓上限。"""
+    text = (name or "").replace(" ", "").replace("\u3000", "")
+    rules = (
+        ("白酒", ("茅台", "五粮液", "汾酒", "洋河", "泸州", "古井", "今世缘", "水井坊")),
+        ("银行", ("银行",)),
+        ("证券", ("证券", "券商")),
+        ("医药", ("药业", "医药", "生物", "制药")),
+        ("通信", ("通信", "光电", "光纤", "光模块", "中际", "天孚", "新易盛", "中兴")),
+        ("半导体", ("芯片", "半导体", "硅", "存储", "中芯", "寒武", "海光", "澜起", "长鑫")),
+        ("机器人", ("机器人", "谐波", "伺服", "宇树", "汇川", "埃斯顿")),
+        ("传媒", ("传媒", "数科", "网络", "影视", "游戏")),
+    )
+    for bucket, keywords in rules:
+        if any(key in text for key in keywords):
+            return bucket
+    code = (symbol or "").strip()
+    if code.startswith("688"):
+        return "科创板"
+    if code.startswith(("300", "301")):
+        return "创业板"
+    if code.startswith(("8", "4")) or code.startswith("92"):
+        return "北交所"
+    return "主板"
 
 
 def _compute_quantity(
@@ -153,7 +323,8 @@ def _safe_float(v: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 ALL_MARKETS: tuple[str, ...] = ("CN", "HK", "US")
-DEFAULT_ALLOCATIONS: dict[str, float] = {"CN": 0.5, "HK": 0.3, "US": 0.2}
+# 默认资金全部给 A 股；港股/美股不自动开仓（账户可另行覆盖 market_allocations）。
+DEFAULT_ALLOCATIONS: dict[str, float] = {"CN": 1.0, "HK": 0.0, "US": 0.0}
 
 
 def normalize_allocations(raw: dict | None) -> dict[str, float]:
@@ -288,6 +459,143 @@ def _serialize_signal(sig: StrategySignalRun) -> dict:
     }
 
 
+def price_passes_entry_band(
+    current_price: float,
+    entry_low: float | None,
+    entry_high: float | None,
+    *,
+    tolerance: float | None = None,
+    max_plan_ratio: float | None = None,
+) -> tuple[bool, str]:
+    """现价须落在入场区间内，且相对计划中轴不能离谱（防串票脏计划）。"""
+    if entry_low is None or entry_high is None:
+        return False, "missing_entry_plan"
+    price = float(current_price)
+    low = float(entry_low)
+    high = float(entry_high)
+    if price <= 0 or low <= 0 or high <= 0:
+        return False, "invalid_entry_plan"
+    if low > high:
+        low, high = high, low
+    tol = float(ENTRY_BAND_TOLERANCE if tolerance is None else tolerance)
+    band_low = low * (1.0 - max(0.0, tol))
+    band_high = high * (1.0 + max(0.0, tol))
+    if price < band_low or price > band_high:
+        return False, "price_outside_entry_band"
+
+    mid = (low + high) / 2.0
+    ratio_cap = float(MAX_ENTRY_PLAN_PRICE_RATIO if max_plan_ratio is None else max_plan_ratio)
+    if mid > 0 and ratio_cap > 1.0:
+        ratio = max(price / mid, mid / price)
+        if ratio > ratio_cap:
+            return False, "entry_plan_price_mismatch"
+    return True, "ok"
+
+
+def allowed_signal_snapshot_dates(
+    market: str,
+    *,
+    max_age_sessions: int | None = None,
+    as_of: date | None = None,
+) -> set[str]:
+    """允许的信号 snapshot_date：当日（若为交易日）+ 往前 max_age_sessions 个交易日。"""
+    from src.platform.scheduling.trading_calendar import _now_in_market_tz, is_trading_day
+
+    age = int(MAX_SIGNAL_AGE_SESSIONS if max_age_sessions is None else max_age_sessions)
+    age = max(0, age)
+    cursor = as_of or _now_in_market_tz(market).date()
+    allowed: set[str] = set()
+    found = 0
+    need = age + 1
+    for _ in range(20):
+        if is_trading_day(market, cursor):
+            allowed.add(cursor.isoformat())
+            found += 1
+            if found >= need:
+                break
+        cursor -= timedelta(days=1)
+    return allowed
+
+
+def signal_snapshot_is_fresh(
+    snapshot_date: str | None,
+    market: str,
+    *,
+    max_age_sessions: int | None = None,
+    as_of: date | None = None,
+) -> tuple[bool, str]:
+    """信号快照是否足够新。"""
+    snap = (snapshot_date or "").strip()
+    if not snap:
+        return False, "missing_snapshot_date"
+    allowed = allowed_signal_snapshot_dates(
+        market, max_age_sessions=max_age_sessions, as_of=as_of
+    )
+    if snap not in allowed:
+        return False, "signal_stale"
+    return True, "ok"
+
+
+def signal_passes_entry_gate(sig: StrategySignalRun) -> tuple[bool, str]:
+    """判断信号是否满足模拟盘自动建仓门禁。
+
+    硬条件：active + buy/add + 有入场区间 + rank_score 达标 + 快照时效。
+    软条件（默认开启）：payload 里需有至少 1 条与个股直接相关的新闻，且新闻偏向不为利空，
+    技术面 catalyst_score 不加分冒充新闻。
+    """
+    status = (sig.status or "").strip().lower()
+    if status != "active":
+        return False, "status_not_active"
+    action = (sig.action or "").strip().lower()
+    if action not in ("buy", "add"):
+        return False, "action_not_entry"
+    if sig.entry_low is None or sig.entry_high is None:
+        return False, "missing_entry_plan"
+    rank = float(sig.rank_score or 0.0)
+    if rank < float(MIN_RANK_SCORE_FOR_ENTRY):
+        return False, "rank_below_threshold"
+
+    market = (sig.stock_market or "CN").strip().upper() or "CN"
+    fresh_ok, fresh_reason = signal_snapshot_is_fresh(sig.snapshot_date, market)
+    if not fresh_ok:
+        return False, fresh_reason
+
+    if not REQUIRE_NEWS_CATALYST:
+        return True, "ok"
+
+    payload = sig.payload if isinstance(sig.payload, dict) else {}
+    news_metric = payload.get("news_metric") if isinstance(payload.get("news_metric"), dict) else {}
+    if int(news_metric.get("direct_news_count") or 0) < 1:
+        return False, "missing_news_catalyst"
+    event_bias = float(news_metric.get("event_bias") or 0.0)
+    if event_bias < float(MIN_EVENT_BIAS_FOR_ENTRY):
+        return False, "bearish_news"
+    return True, "ok"
+
+
+def quote_passes_tape_gate(
+    quote: dict | None,
+    symbol: str,
+    market: str,
+) -> tuple[bool, str]:
+    """现价盘口：接近涨停或成交额过低则不开仓。缺涨跌幅/成交额不拦。"""
+    from src.modules.strategy.entry_candidates import overheat_change_pct
+
+    q = quote or {}
+    mkt = (market or "CN").strip().upper() or "CN"
+    pct = _safe_float(q.get("change_pct"))
+    if mkt == "CN" and pct is not None and pct >= float(overheat_change_pct(symbol)):
+        return False, "near_limit_up"
+    if pct is not None and pct <= 0:
+        return False, "intraday_unconfirmed"
+    turnover = _safe_float(q.get("turnover"))
+    floors = {"CN": MIN_TURNOVER_CN, "HK": MIN_TURNOVER_HK, "US": MIN_TURNOVER_US}
+    floor = float(floors.get(mkt) or 0.0)
+    if turnover is not None and floor > 0 and turnover < floor:
+        return False, "low_liquidity"
+    return True, "ok"
+
+
 class PaperTradingEngine:
     """模拟盘扫描引擎。"""
 
@@ -330,10 +638,13 @@ class PaperTradingEngine:
         self, db: Session, account: PaperTradingAccount,
     ) -> tuple[int, set[tuple[str, str]], list[tuple[PaperTradingPosition, StrategySignalRun | None]]]:
         """检查可入场的策略信号，自动建仓。返回 (建仓数, 新建仓股票key集合, 建仓事件列表)。"""
-        active_markets = [market for market in ALL_MARKETS if _is_trading_time(market)]
+        active_markets = [
+            market for market in ALL_MARKETS
+            if _is_trading_time(market) and entry_window_open(market)
+        ]
         if not active_markets:
             return 0, set(), []
-        # 查询最新活跃买入信号
+        # 查询最新活跃买入信号（SQL 先滤硬条件，新闻催化在内存门禁再确认）
         query = (
             db.query(StrategySignalRun)
             .filter(
@@ -342,6 +653,7 @@ class PaperTradingEngine:
                 StrategySignalRun.action.in_(["buy", "add"]),
                 StrategySignalRun.entry_low.isnot(None),
                 StrategySignalRun.entry_high.isnot(None),
+                StrategySignalRun.rank_score >= float(MIN_RANK_SCORE_FOR_ENTRY),
             )
         )
         # 按投资比例排除不投入（比例为 0）的市场
@@ -349,7 +661,7 @@ class PaperTradingEngine:
         excluded = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
         if excluded:
             query = query.filter(StrategySignalRun.stock_market.notin_(excluded))
-        signals = query.order_by(StrategySignalRun.rank_score.desc()).limit(50).all()
+        signals = query.order_by(StrategySignalRun.rank_score.desc()).limit(80).all()
         entry_events: list[tuple[PaperTradingPosition, StrategySignalRun | None]] = []
         new_keys: set[tuple[str, str]] = set()
         if not signals:
@@ -362,20 +674,77 @@ class PaperTradingEngine:
             .filter(PaperTradingPosition.status == "open")
             .all()
         )
+        sector_counts: dict[str, int] = {}
         for p in open_positions:
             open_keys.add((p.stock_symbol, p.stock_market))
+            bucket = industry_bucket(p.stock_symbol, p.stock_name)
+            sector_counts[bucket] = sector_counts.get(bucket, 0) + 1
 
-        # 收集需要报价的信号（去重：同股票只取 rank_score 最高的一条）
+        entry_limit = min(int(MAX_ENTRIES_PER_SCAN), int(MAX_OPEN_POSITIONS) - len(open_positions))
+        if entry_limit <= 0:
+            return 0, new_keys, entry_events
+        exposure_room = (
+            account.initial_capital * float(MAX_TOTAL_EXPOSURE)
+            - sum(position_buy_cost(p) for p in open_positions)
+        )
+        if exposure_room <= 0:
+            return 0, new_keys, entry_events
+
+        # 平仓冷却：近 REENTRY_COOLDOWN_SESSIONS 个交易日内平过仓的股票不再买入
+        cooling: set[tuple[str, str]] = set()
+        if REENTRY_COOLDOWN_SESSIONS > 0:
+            now = _utc_now()
+            recent = (
+                db.query(PaperTradingTrade.stock_symbol, PaperTradingTrade.stock_market, PaperTradingTrade.closed_at)
+                .filter(PaperTradingTrade.closed_at >= (now - timedelta(days=14)).replace(tzinfo=None))
+                .all()
+            )
+            for sym, mkt, closed_at in recent:
+                if closed_at and trading_days_held(mkt, closed_at, now) < REENTRY_COOLDOWN_SESSIONS:
+                    cooling.add((sym, mkt))
+
+        # 收集需要报价的信号（去重：同股票只取 rank_score 最高的一条；过门禁才入队）
         candidates = []
         seen = set()
+        skipped_gate = 0
         for sig in signals:
             key = (sig.stock_symbol, sig.stock_market)
-            if key in open_keys:
+            if key in open_keys or key in cooling:
                 continue
             if key in seen:
                 continue
+            bucket = industry_bucket(sig.stock_symbol, sig.stock_name)
+            if sector_counts.get(bucket, 0) >= int(MAX_POSITIONS_PER_SECTOR):
+                skipped_gate += 1
+                logger.info(
+                    "[模拟盘] 跳过入场 %s:%s reason=sector_cap sector=%s",
+                    sig.stock_market,
+                    sig.stock_symbol,
+                    bucket,
+                )
+                continue
+            ok, reason = signal_passes_entry_gate(sig)
+            if not ok:
+                skipped_gate += 1
+                logger.debug(
+                    "[模拟盘] 跳过入场 %s:%s reason=%s rank=%.1f",
+                    sig.stock_market,
+                    sig.stock_symbol,
+                    reason,
+                    float(sig.rank_score or 0.0),
+                )
+                continue
             seen.add(key)
             candidates.append(sig)
+
+        if skipped_gate:
+            logger.info(
+                "[模拟盘] 入场门禁过滤: skipped=%s kept=%s min_rank=%.1f require_news=%s",
+                skipped_gate,
+                len(candidates),
+                float(MIN_RANK_SCORE_FOR_ENTRY),
+                bool(REQUIRE_NEWS_CATALYST),
+            )
 
         if not candidates:
             return 0, new_keys, entry_events
@@ -389,6 +758,8 @@ class PaperTradingEngine:
 
         opened = 0
         for sig in candidates:
+            if opened >= entry_limit:
+                break
             if not _is_trading_time(sig.stock_market):
                 continue
             key = (sig.stock_market, sig.stock_symbol)
@@ -399,12 +770,49 @@ class PaperTradingEngine:
             if current_price is None or current_price <= 0:
                 continue
 
+            band_ok, band_reason = price_passes_entry_band(
+                current_price, sig.entry_low, sig.entry_high
+            )
+            if not band_ok:
+                logger.info(
+                    "[模拟盘] 跳过入场 %s:%s reason=%s price=%.4f band=%.4f-%.4f",
+                    sig.stock_market,
+                    sig.stock_symbol,
+                    band_reason,
+                    current_price,
+                    float(sig.entry_low or 0.0),
+                    float(sig.entry_high or 0.0),
+                )
+                continue
+            tape_ok, tape_reason = quote_passes_tape_gate(
+                quote, sig.stock_symbol, sig.stock_market
+            )
+            if not tape_ok:
+                logger.info(
+                    "[模拟盘] 跳过入场 %s:%s reason=%s change_pct=%s turnover=%s",
+                    sig.stock_market,
+                    sig.stock_symbol,
+                    tape_reason,
+                    quote.get("change_pct"),
+                    quote.get("turnover"),
+                )
+                continue
+
             # 用当前市价入场
             entry_price = current_price
             mkt = sig.stock_market
             if alloc.get(mkt, 0.0) <= 0:
                 continue  # 该市场比例为 0，不投入
-            avail = market_cash.get(mkt, 0.0)
+            bucket = industry_bucket(sig.stock_symbol, sig.stock_name)
+            if sector_counts.get(bucket, 0) >= int(MAX_POSITIONS_PER_SECTOR):
+                logger.info(
+                    "[模拟盘] 跳过入场 %s:%s reason=sector_cap sector=%s",
+                    sig.stock_market,
+                    sig.stock_symbol,
+                    bucket,
+                )
+                continue
+            avail = min(market_cash.get(mkt, 0.0), exposure_room)
 
             # 仓位管理:按信号强度分配该市场预算(替换原固定 100 股)
             market_budget = account.initial_capital * alloc.get(mkt, 0.0)
@@ -414,6 +822,7 @@ class PaperTradingEngine:
                 price=entry_price,
                 available_cash=avail,
                 cost_model=COST_MODEL,
+                lot=lot_size(sig.stock_symbol, sig.stock_market),
             )
             if quantity <= 0:
                 continue  # 子池额度不足以买入最小一手
@@ -434,12 +843,7 @@ class PaperTradingEngine:
                     target_ratio = ((target_price - orig_mid) / orig_mid) if target_price else 0.15
                     stop_loss = round(entry_price * (1 + stop_ratio), 4)
                     target_price = round(entry_price * (1 + target_ratio), 4) if target_price else None
-            # 兜底：止损不合理时用默认 -8%
-            if not stop_loss or stop_loss <= 0 or stop_loss >= entry_price:
-                stop_loss = round(entry_price * 0.92, 4)
-            # 兜底：止盈不合理时用默认 +15%
-            if not target_price or target_price <= 0 or target_price <= entry_price:
-                target_price = round(entry_price * 1.15, 4)
+            stop_loss, target_price = clamp_exit_levels(entry_price, stop_loss, target_price)
 
             pos = PaperTradingPosition(
                 stock_symbol=sig.stock_symbol,
@@ -464,7 +868,8 @@ class PaperTradingEngine:
             account.current_capital -= buy_outlay
             if mkt == "CN":
                 consume_cn_proceeds(db, buy_outlay, now=_utc_now())
-            market_cash[mkt] = avail - buy_outlay
+            market_cash[mkt] = market_cash.get(mkt, 0.0) - buy_outlay
+            exposure_room -= buy_outlay
             # A different market's cached limit must also reflect this outlay.
             for other in ALL_MARKETS:
                 if other != mkt:
@@ -472,6 +877,8 @@ class PaperTradingEngine:
                         db, account.current_capital, other, now=_utc_now(), all_markets=True))
             open_keys.add((sig.stock_symbol, sig.stock_market))
             new_keys.add((sig.stock_symbol, sig.stock_market))
+            filled_bucket = industry_bucket(sig.stock_symbol, sig.stock_name)
+            sector_counts[filled_bucket] = sector_counts.get(filled_bucket, 0) + 1
             entry_events.append((pos, sig))
             opened += 1
             logger.info(
@@ -623,18 +1030,15 @@ class PaperTradingEngine:
                 closed += 1
                 continue
 
-            # 移动止损:浮盈达标后,从持仓最高价回撤超阈值则离场
-            if pos.highest_price and pos.entry_price > 0:
-                profit_ratio = (pos.highest_price - pos.entry_price) / pos.entry_price
-                if profit_ratio >= MIN_PROFIT_FOR_TRAILING:
-                    trail_line = pos.highest_price * (1 - TRAILING_STOP_PCT)
-                    if current_price <= trail_line:
-                        trade = self._close_position(db, account, pos, current_price, "trailing_stop")
-                        exit_events.append((pos, trade))
-                        closed += 1
-                        continue
+            # 移动止损:浮盈达标后,从持仓最高价回撤超阈值则离场(离场线不低于买入价)
+            trail_line = trailing_stop_line(pos.entry_price, pos.highest_price or 0.0)
+            if trail_line is not None and current_price <= trail_line:
+                trade = self._close_position(db, account, pos, current_price, "trailing_stop")
+                exit_events.append((pos, trade))
+                closed += 1
+                continue
 
-            # 检查信号反转
+            # 检查信号反转:取该股最新快照的信号,不按状态过滤
             if pos.signal_run_id:
                 # no_autoflush: 信号查询是只读的,不要把本轮累积的持仓现价更新提前 flush——
                 # 否则扫描中途会反复抢 SQLite 写锁,与其它调度器并发写时触发 "database is locked"。
@@ -645,18 +1049,20 @@ class PaperTradingEngine:
                         .filter(
                             StrategySignalRun.stock_symbol == pos.stock_symbol,
                             StrategySignalRun.stock_market == pos.stock_market,
-                            StrategySignalRun.status == "active",
                         )
-                        .order_by(StrategySignalRun.created_at.desc())
+                        .order_by(
+                            StrategySignalRun.snapshot_date.desc(),
+                            StrategySignalRun.updated_at.desc(),
+                        )
                         .first()
                     )
-                if latest and latest.action in ("sell", "reduce"):
+                if latest and (latest.action or "") in REVERSAL_ACTIONS:
                     trade = self._close_position(db, account, pos, current_price, "signal_reversal")
                     exit_events.append((pos, trade))
                     closed += 1
                     continue
 
-            # 时间止损:持有超过最大自然日离场(优先用 signal 的 holding_days)
+            # 时间止损:持有超过最大交易日离场(信号天数与机会盘上限取较小值)
             max_days = DEFAULT_TIME_STOP_DAYS
             if pos.signal_run_id:
                 sig_hold = (
@@ -665,12 +1071,9 @@ class PaperTradingEngine:
                     .scalar()
                 )
                 if sig_hold and int(sig_hold) > 0:
-                    max_days = int(sig_hold)
+                    max_days = min(int(sig_hold), int(DEFAULT_TIME_STOP_DAYS))
             if pos.opened_at:
-                opened_dt = pos.opened_at
-                if opened_dt.tzinfo is None:
-                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
-                if (_utc_now() - opened_dt).days >= max_days:
+                if trading_days_held(pos.stock_market, pos.opened_at, _utc_now()) >= max_days:
                     trade = self._close_position(db, account, pos, current_price, "time_stop")
                     exit_events.append((pos, trade))
                     closed += 1

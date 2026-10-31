@@ -18,6 +18,57 @@ def test_eastmoney_kline_parses(monkeypatch):
     assert len(out) == 2 and out[1].high == 6.0
 
 
+def test_ths_kline_parses_last_js(monkeypatch):
+    """同花顺 last.js:日期无横杠;字段顺序为 开高低收(不同于腾讯/东财)。"""
+    body = (
+        'quotebridge_v6_line_hs_600519_01_last({"name":"贵州茅台","year":{},'
+        '"data":"20260701,1,4,0.5,3,100,1;20260702,3,6,2,5,200,1"})'
+    )
+    monkeypatch.setattr(kv, "market_get", lambda *a, **k: body)
+    out = kv.ThsKlineVendor().fetch([Symbol.parse("600519", market="CN")], {"days": 60})
+    assert len(out) == 2 and isinstance(out[0], Bar)
+    assert out[0].date == "2026-07-01"
+    assert out[0].open == 1.0 and out[0].high == 4.0 and out[0].low == 0.5 and out[0].close == 3.0
+    assert out[1].volume == 200.0
+
+
+def test_ths_kline_backfills_year_slices(monkeypatch):
+    calls: list[str] = []
+
+    def fake(url, **k):
+        calls.append(url)
+        if url.endswith("/last.js"):
+            return (
+                'quotebridge_v6_line_hs_600519_01_last({"year":{"2025":2,"2026":1},'
+                '"data":"20260102,1,2,0.5,1.5,10"})'
+            )
+        if url.endswith("/2026.js"):
+            return 'quotebridge_v6_line_hs_600519_01_2026({"data":"20260102,1,2,0.5,1.5,10"})'
+        if url.endswith("/2025.js"):
+            return (
+                'quotebridge_v6_line_hs_600519_01_2025({"data":'
+                '"20250102,1,2,0.5,1.5,10;20250601,2,3,1,2.5,20"})'
+            )
+        return None
+
+    monkeypatch.setattr(kv, "market_get", fake)
+    out = kv.ThsKlineVendor().fetch([Symbol.parse("600519", market="CN")], {"days": 3})
+    assert [b.date for b in out] == ["2025-01-02", "2025-06-01", "2026-01-02"]
+    assert any(u.endswith("/2025.js") for u in calls)
+
+
+def test_ths_kline_skips_non_cn(monkeypatch):
+    calls = {"n": 0}
+
+    def fake(*a, **k):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(kv, "market_get", fake)
+    assert kv.ThsKlineVendor().fetch([Symbol.parse("00700", market="HK")], {"days": 30}) == []
+    assert calls["n"] == 0
+
+
 def test_stooq_kline_parses(monkeypatch):
     csv = "Date,Open,High,Low,Close,Volume\n2026-07-01,1,4,0.5,3,100\n2026-07-02,3,6,2,5,200\n"
     monkeypatch.setattr(kv, "market_get", lambda *a, **k: csv)

@@ -6,12 +6,13 @@ from src.platform.marketdata.outcome_prices import completed_outcome_bar
 
 import logging
 from datetime import date, datetime, timedelta
-from math import sqrt
+from math import sqrt, tanh
 
 from sqlalchemy import and_, case, func
 
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
-from src.modules.strategy.entry_candidates import refresh_entry_candidates
+from src.modules.market.news_store import MIN_SIGNAL_STRENGTH
+from src.modules.strategy.entry_candidates import normalize_stock_name, refresh_entry_candidates
 from src.platform.persistence.json_safe import to_jsonable
 from src.modules.strategy.strategy_catalog import (
     ensure_strategy_catalog,
@@ -25,8 +26,8 @@ from src.platform.marketdata.models import MarketCode
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import (
     EntryCandidate,
+    MarketNews,
     MarketRegimeSnapshot,
-    NewsCache,
     PortfolioRiskSnapshot,
     StrategyFactorSnapshot,
     StrategyOutcome,
@@ -169,39 +170,12 @@ REGIME_LABELS = {
     "bearish": "空头",
 }
 
-POSITIVE_EVENT_KEYWORDS = (
-    "增持",
-    "中标",
-    "合作",
-    "回购",
-    "盈利",
-    "订单",
-    "突破",
-    "上调",
-    "增长",
-    "利好",
-    "buyback",
-    "contract",
-    "beat",
-    "upgrade",
-)
-
-NEGATIVE_EVENT_KEYWORDS = (
-    "减持",
-    "诉讼",
-    "亏损",
-    "下调",
-    "违约",
-    "处罚",
-    "暴跌",
-    "利空",
-    "预警",
-    "st",
-    "downgrade",
-    "miss",
-    "fraud",
-    "investigation",
-)
+# 事件新闻 relation_level（0-10）达到该值视为与个股直接相关；大盘综述类挂靠多在 2-4
+DIRECT_NEWS_RELATION_LEVEL = 5
+# 一条新闻挂靠超过该数量代码，视为板块/大盘综述，不计个股直接新闻（工行银行综述）
+GENERIC_NEWS_SYMBOL_CAP = 3
+# 信号层偏空下限：event_bias 低于此值的买入信号降为观望
+MIN_EVENT_BIAS_FOR_SIGNAL = 0.0
 
 MAX_UNHELD_ACTIVE_BY_MARKET = {
     "CN": 30,
@@ -475,6 +449,100 @@ def _upsert_market_regime_snapshots(
     return rows
 
 
+def _news_fingerprint(text: str | None) -> str:
+    """同一条新闻（转载/多源重复）对同一股票只计一次热度和偏向。"""
+    return normalize_stock_name(text)[:160]
+
+
+def _fresh_news_symbols(
+    symbols: set[str],
+    fingerprint: str,
+    seen: set[tuple[str, str]],
+) -> set[str]:
+    if not fingerprint:
+        return set(symbols)
+    fresh: set[str] = set()
+    for sym in symbols:
+        key = (sym, fingerprint)
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.add(sym)
+    return fresh
+
+
+def _accumulate_news_metric(
+    metrics: dict[str, dict],
+    *,
+    symbols: set[str],
+    importance: int,
+    event_bias: float,
+    age_hours: float,
+    direct: bool = False,
+    impact: float = 0.0,
+) -> None:
+    recency_weight = _clamp(1.0 - age_hours / 72.0, 0.05, 1.0)
+    event_weight = recency_weight * (0.8 + 0.6 * max(0, int(importance)))
+    for sym in symbols:
+        m = metrics.setdefault(
+            sym,
+            {
+                "news_count": 0,
+                "high_importance_count": 0,
+                "direct_news_count": 0,
+                "importance_weighted": 0.0,
+                "event_bias_sum": 0.0,
+                "news_impact": 0.0,
+                "latest_age_hours": None,
+                "event_score": 0.0,
+                "event_bias": 0.0,
+            },
+        )
+        m["news_count"] += 1
+        m["news_impact"] += float(impact)
+        if importance >= 2:
+            m["high_importance_count"] += 1
+        if direct:
+            m["direct_news_count"] += 1
+        m["importance_weighted"] += float(event_weight)
+        m["event_bias_sum"] += float(event_bias * recency_weight)
+        if (m["latest_age_hours"] is None) or (age_hours < float(m["latest_age_hours"])):
+            m["latest_age_hours"] = float(age_hours)
+
+
+def _finalize_news_metrics(metrics: dict[str, dict]) -> dict[str, dict]:
+    for _sym, m in metrics.items():
+        cnt = int(m["news_count"] or 0)
+        imp = float(m["importance_weighted"] or 0.0)
+        hi_cnt = int(m["high_importance_count"] or 0)
+        latest_age = float(m["latest_age_hours"] or 72.0)
+        freshness_bonus = _clamp((24.0 - latest_age) / 8.0, -2.0, 3.0)
+        event_score = _clamp(imp * 1.2 + hi_cnt * 1.4 + freshness_bonus, -6.0, EVENT_SCORE_CAP)
+        event_bias = _clamp(float(m["event_bias_sum"] or 0.0) / max(1.0, cnt), -3.0, 3.0)
+        m["direct_news_count"] = min(int(m["direct_news_count"] or 0), DIRECT_NEWS_COUNT_CAP)
+        m["event_score"] = round(event_score, 4)
+        m["event_bias"] = round(event_bias, 4)
+        m["news_impact"] = round(float(m.get("news_impact") or 0.0), 4)
+        m["event_tier"] = (
+            "high" if event_score >= 5.0 else "medium" if event_score >= 3.0 else "low"
+        )
+    return metrics
+
+
+def _market_news_importance(relation_level: int, analyzed: int) -> int:
+    """把事件页 relation_level(0-10) 映射到 0-3 重要性。"""
+    level = max(0, int(relation_level or 0))
+    if int(analyzed or 0) <= 0:
+        return 1 if level <= 0 else min(2, max(1, (level + 2) // 4))
+    if level >= 7:
+        return 3
+    if level >= 4:
+        return 2
+    if level >= 1:
+        return 1
+    return 1
+
+
 def _load_news_metrics(
     *,
     db,
@@ -482,6 +550,11 @@ def _load_news_metrics(
     lookback_hours: int = 72,
     max_rows: int = 5000,
 ) -> dict[str, dict]:
+    """按候选股票汇总新闻催化指标。
+
+    主源：事件驱动 ``market_news``，**仅已分析且利多利空足够明确**（``analyzed=1``、``|bullish_level|>=MIN_SIGNAL_STRENGTH``）才计入机会催化；
+    未分析或中性 / 弱信号新闻不参与加分/门禁。
+    """
     if not candidates:
         return {}
     symbol_set = {
@@ -490,7 +563,7 @@ def _load_news_metrics(
         if (c.stock_symbol or "").strip()
     }
     symbol_name_map = {
-        (c.stock_symbol or "").strip().upper(): (c.stock_name or "").strip()
+        (c.stock_symbol or "").strip().upper(): normalize_stock_name(c.stock_name)
         for c in candidates
         if (c.stock_symbol or "").strip()
     }
@@ -503,98 +576,93 @@ def _load_news_metrics(
         return {}
 
     cutoff = utc_now() - timedelta(hours=max(1, int(lookback_hours)))
-    rows = (
-        db.query(NewsCache)
-        .filter(NewsCache.publish_time >= cutoff)
-        .order_by(NewsCache.publish_time.desc())
-        .limit(max(100, int(max_rows)))
-        .all()
-    )
-    if not rows:
-        return {}
-
     now = utc_now()
     metrics: dict[str, dict] = {}
+    row_cap = max(100, int(max_rows))
 
-    for n in rows:
-        linked = set()
-        for s in (n.symbols or []):
-            x = str(s or "").strip().upper()
-            if x and x in symbol_set:
-                linked.add(x)
-        if not linked:
-            # Fallback: match by stock name mention in title/content to improve hit rate.
-            text_for_match = f"{n.title or ''} {n.content or ''}"
-            if text_for_match:
-                for name, sym in name_symbol_pairs:
-                    if name in text_for_match:
-                        linked.add(sym)
-            if not linked:
+    market_rows = (
+        db.query(MarketNews)
+        .filter(
+            MarketNews.news_time >= cutoff,
+            MarketNews.analyzed == 1,
+            func.abs(func.coalesce(MarketNews.bullish_level, 0)) >= MIN_SIGNAL_STRENGTH,
+        )
+        .order_by(MarketNews.news_time.desc())
+        .limit(row_cap)
+        .all()
+    )
+    seen_news: set[tuple[str, str]] = set()
+    for n in market_rows:
+        if int(getattr(n, "analyzed", 0) or 0) != 1:
+            continue
+        relation_codes: set[str] = set()
+        linked: set[str] = set()
+        for item in n.relations_stocks or []:
+            if not isinstance(item, dict):
                 continue
-        title = str(n.title or "")
-        content = str(n.content or "")
-        text = f"{title} {content}".lower()
-        event_bias = 0.0
-        for kw in POSITIVE_EVENT_KEYWORDS:
-            if kw.lower() in text:
-                event_bias += 1.0
-        for kw in NEGATIVE_EVENT_KEYWORDS:
-            if kw.lower() in text:
-                event_bias -= 1.2
+            code = str(item.get("code") or "").strip().upper()
+            if not code:
+                continue
+            relation_codes.add(code)
+            if code in symbol_set:
+                linked.add(code)
+        name_only = False
+        digest = normalize_stock_name(n.digest)
+        if not linked and digest:
+            for name, sym in name_symbol_pairs:
+                if name and name in digest:
+                    linked.add(sym)
+                    name_only = True
+        if not linked:
+            continue
 
-        importance = int(n.importance or 0)
-        published_at = n.publish_time
-        if published_at is None:
-            published_at = now
+        published_at = n.news_time or now
         if published_at.tzinfo is None:
             published_at = published_at.replace(tzinfo=now.tzinfo)
         age_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
-        recency_weight = _clamp(1.0 - age_hours / 72.0, 0.05, 1.0)
-        event_weight = recency_weight * (0.8 + 0.6 * importance)
-
-        for sym in linked:
-            m = metrics.setdefault(
-                sym,
-                {
-                    "news_count": 0,
-                    "high_importance_count": 0,
-                    "importance_weighted": 0.0,
-                    "event_bias_sum": 0.0,
-                    "latest_age_hours": None,
-                    "event_score": 0.0,
-                    "event_bias": 0.0,
-                },
-            )
-            m["news_count"] += 1
-            if importance >= 2:
-                m["high_importance_count"] += 1
-            m["importance_weighted"] += float(event_weight)
-            m["event_bias_sum"] += float(event_bias * recency_weight)
-            if (m["latest_age_hours"] is None) or (age_hours < float(m["latest_age_hours"])):
-                m["latest_age_hours"] = float(age_hours)
-
-    for sym, m in metrics.items():
-        cnt = int(m["news_count"] or 0)
-        imp = float(m["importance_weighted"] or 0.0)
-        hi_cnt = int(m["high_importance_count"] or 0)
-        latest_age = float(m["latest_age_hours"] or 72.0)
-        freshness_bonus = _clamp((24.0 - latest_age) / 8.0, -2.0, 3.0)
-        event_score = _clamp(imp * 1.2 + hi_cnt * 1.4 + freshness_bonus, -6.0, 12.0)
-        event_bias = _clamp(float(m["event_bias_sum"] or 0.0) / max(1.0, cnt), -3.0, 3.0)
-        m["event_score"] = round(event_score, 4)
-        m["event_bias"] = round(event_bias, 4)
-        m["event_tier"] = (
-            "high" if event_score >= 6.5 else "medium" if event_score >= 3.0 else "low"
+        relation_level = int(n.relation_level or 0)
+        importance = _market_news_importance(relation_level, 1)
+        # 已分析新闻只用 LLM 涨跌偏向（-10~10 折到 ±2）；关键词会把「营收增长、净利下降」误判为利好
+        bullish = float(n.bullish_level or 0.0)
+        event_bias = _clamp(bullish / 5.0, -2.0, 2.0)
+        # 仅标题点名、或一条新闻挂靠过多代码，都算综述，不记个股直接新闻
+        fanout = len(relation_codes) if relation_codes else len(linked)
+        is_direct = (
+            (not name_only)
+            and relation_level >= DIRECT_NEWS_RELATION_LEVEL
+            and fanout <= GENERIC_NEWS_SYMBOL_CAP
         )
-    return metrics
+        linked = _fresh_news_symbols(linked, _news_fingerprint(n.digest), seen_news)
+        if not linked:
+            continue
+        _accumulate_news_metric(
+            metrics,
+            symbols=linked,
+            importance=importance,
+            event_bias=event_bias,
+            age_hours=age_hours,
+            direct=is_direct,
+            impact=_news_impact(
+                bullish=bullish,
+                relation_level=relation_level,
+                age_hours=age_hours,
+                name_only=name_only,
+            ),
+        )
+
+    if not metrics:
+        return {}
+    return _finalize_news_metrics(metrics)
 
 
 def _default_news_metric() -> dict:
     return {
         "news_count": 0,
         "high_importance_count": 0,
+        "direct_news_count": 0,
         "importance_weighted": 0.0,
         "event_bias_sum": 0.0,
+        "news_impact": 0.0,
         "latest_age_hours": None,
         "event_score": 0.0,
         "event_bias": 0.0,
@@ -713,6 +781,128 @@ def _demote_signal(row: StrategySignalRun, *, reason: str) -> None:
     row.updated_at = utc_now()
 
 
+# 单股新闻热度/直接条数封顶，避免工行这类综述堆分（热度仅用于展示与分档）
+EVENT_SCORE_CAP = 6.0
+DIRECT_NEWS_COUNT_CAP = 2
+# 新闻催化：单条影响 = 利多利空强度 × 关联权重 × 点名系数 × 时效衰减，按股票累加后 tanh 平滑封顶。
+# 校准：1 条新鲜、强关联的 +2 / +5 / +8 新闻约 +1.1 / +2.5 / +3.4；两条 +5 约 +3.8；上限 4.5。
+NEWS_CATALYST_CAP = 4.5
+NEWS_IMPACT_SCALE = 0.8
+NEWS_IMPACT_HALF_LIFE_HOURS = 24.0
+# 利空比利多更要紧：同强度利空按 1.5 倍计。
+NEWS_BEARISH_WEIGHT = 1.5
+# 只在正文点名、未列入关联股票的新闻打五折。
+NEWS_NAME_ONLY_WEIGHT = 0.5
+
+
+def _news_relevance_weight(relation_level: int) -> float:
+    level = int(relation_level or 0)
+    if level >= 7:
+        return 1.0
+    if level >= 4:
+        return 0.7
+    if level >= 1:
+        return 0.4
+    return 0.0
+
+
+def _news_impact(*, bullish: float, relation_level: int, age_hours: float, name_only: bool) -> float:
+    """单条新闻对某只股票的有向影响；时效只衰减不反号，旧的利多新闻不会变成扣分。"""
+    strength = _clamp(float(bullish or 0.0) / 10.0, -1.0, 1.0)
+    decay = 0.5 ** (max(0.0, float(age_hours)) / NEWS_IMPACT_HALF_LIFE_HOURS)
+    weight = _news_relevance_weight(relation_level) * decay
+    if name_only:
+        weight *= NEWS_NAME_ONLY_WEIGHT
+    impact = strength * weight
+    return impact * NEWS_BEARISH_WEIGHT if impact < 0 else impact
+
+
+def _news_catalyst(news_impact: float) -> float:
+    """累计影响 → 催化分：方向强弱线性起作用，多条新闻边际递减，上下限 ±4.5。"""
+    return NEWS_CATALYST_CAP * tanh(float(news_impact or 0.0) / NEWS_IMPACT_SCALE)
+
+
+ACTIONABLE_RANK_FLOOR = 75.0
+ACTIONABLE_RANK_CEIL = 100.0
+
+
+def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
+    """可执行信号（active + buy/add + 有区间 + 分数≥75）按同日同市场百分位重映射到 [75, 100]，
+    避免叠加分数集体封顶 100 后无法排序。按股票排名：同一只股票的各策略行取其最高 composite，
+    共享同一个分数，排序比的是股票而不是同股的策略权重。返回重映射条数。"""
+    by_market: dict[str, list[tuple[StrategySignalRun, float]]] = {}
+    for r in rows:
+        if (r.status or "inactive") != "active":
+            continue
+        if (r.action or "watch") not in ("buy", "add"):
+            continue
+        if r.entry_low is None or r.entry_high is None:
+            continue
+        if float(r.rank_score or 0.0) < ACTIONABLE_RANK_FLOOR:
+            continue
+        payload = r.payload if isinstance(r.payload, dict) else {}
+        breakdown = payload.get("score_breakdown") if isinstance(payload.get("score_breakdown"), dict) else {}
+        composite = _safe_float(breakdown.get("composite_score"))
+        if composite is None:
+            composite = float(r.rank_score or 0.0)
+        market = (r.stock_market or "CN").strip().upper() or "CN"
+        by_market.setdefault(market, []).append((r, composite))
+
+    changed = 0
+    span = ACTIONABLE_RANK_CEIL - ACTIONABLE_RANK_FLOOR
+    for items in by_market.values():
+        stock_best: dict[str, float] = {}
+        for row, composite in items:
+            sym = (row.stock_symbol or "").strip()
+            stock_best[sym] = max(stock_best.get(sym, composite), composite)
+        levels = sorted(set(stock_best.values()))
+        denom = len(levels) - 1
+        for row, _ in items:
+            stock_score = stock_best[(row.stock_symbol or "").strip()]
+            pct = levels.index(stock_score) / denom if denom > 0 else 1.0
+            score = round(ACTIONABLE_RANK_FLOOR + span * pct, 4)
+            payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+            breakdown = dict(payload.get("score_breakdown") or {})
+            breakdown["weighted_score"] = score
+            breakdown["rank_pct"] = round(pct * 100.0, 2)
+            payload["score_breakdown"] = breakdown
+            row.payload = to_jsonable(payload)
+            row.rank_score = score
+            changed += 1
+    return changed
+
+
+def _apply_direct_news_constraint(*, rows: list[StrategySignalRun]) -> dict:
+    """未持仓买入信号须有个股直接新闻，且新闻偏向不为利空，否则降为观望。"""
+    missing = 0
+    bearish = 0
+    for row in rows:
+        if (row.status or "inactive") != "active":
+            continue
+        if (row.action or "watch") not in ("buy", "add"):
+            continue
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        news_metric = (
+            payload.get("news_metric")
+            if isinstance(payload.get("news_metric"), dict)
+            else {}
+        )
+        if int(news_metric.get("direct_news_count") or 0) < 1:
+            _demote_signal(row, reason="缺少个股直接新闻")
+            missing += 1
+            continue
+        event_bias = float(news_metric.get("event_bias") or 0.0)
+        if event_bias < float(MIN_EVENT_BIAS_FOR_SIGNAL):
+            _demote_signal(row, reason="新闻偏向偏空")
+            bearish += 1
+    by_reason: dict[str, int] = {}
+    if missing:
+        by_reason["missing_direct_news"] = missing
+    if bearish:
+        by_reason["bearish_news"] = bearish
+    return {"demoted": missing + bearish, "by_reason": by_reason}
+
+
 def _apply_portfolio_constraints(*, rows: list[StrategySignalRun]) -> dict:
     by_market: dict[str, list[StrategySignalRun]] = {}
     for r in rows:
@@ -731,19 +921,19 @@ def _apply_portfolio_constraints(*, rows: list[StrategySignalRun]) -> dict:
         ]
         active_unheld.sort(key=lambda x: float(x.rank_score or 0.0), reverse=True)
 
+        # 上限按股票只数计：同一只股票的多条策略信号只占一个名额
         max_unheld = int(MAX_UNHELD_ACTIVE_BY_MARKET.get(market, 20))
-        for idx, row in enumerate(active_unheld):
-            if idx < max_unheld:
+        kept_stocks: set[str] = set()
+        remaining: list[StrategySignalRun] = []
+        for row in active_unheld:
+            sym = (row.stock_symbol or "").strip()
+            if sym in kept_stocks or len(kept_stocks) < max_unheld:
+                kept_stocks.add(sym)
+                remaining.append(row)
                 continue
             _demote_signal(row, reason=f"组合约束: {market} 未持仓机会超限({max_unheld})")
             demoted += 1
             by_reason["cap_unheld"] = by_reason.get("cap_unheld", 0) + 1
-
-        remaining = [
-            x
-            for x in active_unheld[:max_unheld]
-            if (x.status or "inactive") == "active"
-        ]
         if not remaining:
             continue
 
@@ -828,14 +1018,14 @@ def _compute_factor_breakdown(
         catalyst_score += 1.5
     if "超跌" in signal_text:
         catalyst_score += 1.0
-    catalyst_score += _clamp(event_score * 0.55, -3.0, 6.5)
-    if event_bias > 0.8:
-        catalyst_score += 1.2
+    news_impact = float(_safe_float(nm.get("news_impact")) or 0.0)
+    news_catalyst = _news_catalyst(news_impact)
+    catalyst_score += news_catalyst
     if relative_strength_pct is not None:
         catalyst_score += _clamp((relative_strength_pct - 60.0) / 12.0, -2.5, 4.5)
 
     quality_score = _clamp((plan_quality - 50.0) / 5.0, -8.0, 10.0)
-    if event_count >= 3:
+    if min(event_count, 3) >= 3 and event_bias >= 0:
         quality_score += 0.8
 
     risk_penalty = 0.0
@@ -895,7 +1085,8 @@ def _compute_factor_breakdown(
         raw_score -= 8.0
     if action in ("buy", "add") and plan_quality < 90:
         raw_score -= 6.0
-    final_score = _clamp(raw_score * float(weight or 1.0) * regime_multiplier, 0.0, 100.0)
+    composite_score = raw_score * float(weight or 1.0) * regime_multiplier
+    final_score = _clamp(composite_score, 0.0, 100.0)
     # Keep score semantics aligned with action/status: high scores should be actionable.
     if (row.status or "inactive") != "active":
         final_score = min(final_score, 69.0)
@@ -916,6 +1107,7 @@ def _compute_factor_breakdown(
         "regime_label": _regime_label(regime),
         "regime_multiplier": round(regime_multiplier, 4),
         "raw_score": round(raw_score, 4),
+        "composite_score": round(composite_score, 4),
         "weighted_score": round(final_score, 4),
         "weight": round(float(weight or 1.0), 4),
         "relative_strength_pct": round(float(relative_strength_pct or 0.0), 4)
@@ -923,6 +1115,8 @@ def _compute_factor_breakdown(
         else None,
         "event_score": round(float(event_score), 4),
         "event_bias": round(float(event_bias), 4),
+        "news_impact": round(float(news_impact), 4),
+        "news_catalyst": round(float(news_catalyst), 4),
         "event_count": event_count,
         "crowding_risk": round(float(crowding_risk or 0.0), 4),
         "has_entry_plan": bool(has_entry),
@@ -1072,6 +1266,7 @@ def _format_signal(
     *,
     include_payload: bool = True,
     factor_snapshot: StrategyFactorSnapshot | None = None,
+    sibling_strategy_codes: list[str] | None = None,
 ) -> dict:
     payload_raw = row.payload if isinstance(row.payload, dict) else {}
     payload = _compact_signal_payload(payload_raw) if include_payload else {}
@@ -1157,6 +1352,7 @@ def _format_signal(
         "stock_market": row.stock_market,
         "stock_name": row.stock_name,
         "strategy_code": row.strategy_code,
+        "strategy_codes": list(sibling_strategy_codes or ([row.strategy_code] if row.strategy_code else [])),
         "strategy_name": row.strategy_name,
         "strategy_version": row.strategy_version,
         "risk_level": row.risk_level,
@@ -1207,6 +1403,9 @@ def refresh_strategy_signals(
     limit_candidates: int = 2000,
     markets: list[str] | None = None,
 ) -> dict:
+    from src.modules.strategy.opportunity_markets import resolve_opportunity_markets
+
+    markets = resolve_opportunity_markets(markets)
     if markets == []:
         return {"snapshot_date": snapshot_date, "count": 0, "items": []}
     ensure_strategy_catalog()
@@ -1262,21 +1461,48 @@ def refresh_strategy_signals(
                     StrategySignalRun.stock_market.in_(markets) if markets is not None else True)
             .all()
         )
-        existing: dict[tuple[int, str], StrategySignalRun] = {}
+        # 按 (symbol, market, strategy_code) 复用行，避免候选表删建后 ID 复用导致「票 A 挂票 B 计划」。
+        existing: dict[tuple[str, str, str], StrategySignalRun] = {}
+        dup_stale_ids: list[int] = []
         for row in existing_rows:
-            cand_id = row.source_candidate_id
-            code = row.strategy_code
-            if cand_id is None:
+            sym = (row.stock_symbol or "").strip()
+            mkt = (row.stock_market or "CN").strip().upper() or "CN"
+            code = str(row.strategy_code or "")
+            if not sym:
+                if row.id is not None:
+                    dup_stale_ids.append(int(row.id))
                 continue
-            existing[(int(cand_id), str(code or ""))] = row
+            key = (sym, mkt, code)
+            prev = existing.get(key)
+            if prev is None:
+                existing[key] = row
+                continue
+            prev_ts = prev.updated_at.timestamp() if prev.updated_at else 0.0
+            row_ts = row.updated_at.timestamp() if row.updated_at else 0.0
+            if row_ts >= prev_ts:
+                if prev.id is not None:
+                    dup_stale_ids.append(int(prev.id))
+                existing[key] = row
+            elif row.id is not None:
+                dup_stale_ids.append(int(row.id))
+
+        # 先清同键重复行，避免后续刷新 source_candidate_id 撞唯一约束。
+        if dup_stale_ids:
+            db.query(StrategySignalRun).filter(
+                StrategySignalRun.id.in_(sorted(set(dup_stale_ids)))
+            ).delete(synchronize_session=False)
+            db.flush()
 
         weight_cache: dict[str, dict[str, float]] = {}
         factor_weight_cache: dict[str, dict[str, float]] = {}
-        touched_keys: set[tuple[int, str]] = set()
+        touched_keys: set[tuple[str, str, str]] = set()
         touched_rows: list[StrategySignalRun] = []
 
         for c in candidates:
             market = (c.stock_market or "CN").strip().upper() or "CN"
+            symbol = (c.stock_symbol or "").strip()
+            if not symbol:
+                continue
             weights = weight_cache.get(market)
             if weights is None:
                 weights = get_effective_weight_map(market=market, regime="default")
@@ -1301,7 +1527,7 @@ def refresh_strategy_signals(
                     "regime": "neutral",
                     "confidence": 0.0,
                 }
-                symbol_key = (c.stock_symbol or "").strip().upper()
+                symbol_key = symbol.upper()
                 normalized_news_metric = _normalize_news_metric(news_metrics.get(symbol_key))
                 score_breakdown = _compute_factor_breakdown(
                     row=c,
@@ -1322,9 +1548,9 @@ def refresh_strategy_signals(
                 action = (c.action or "watch").strip().lower() or "watch"
                 action_label = (c.action_label or "观望").strip() or "观望"
                 if bool(c.is_holding_snapshot):
-                    if action == "buy":
+                    if action in ("buy", "add"):
                         action = "add"
-                        action_label = "准备加仓"
+                        action_label = "持有/加仓"
                 else:
                     if action == "add":
                         action = "buy"
@@ -1347,20 +1573,25 @@ def refresh_strategy_signals(
                     "cross_feature": cross_features.get(int(c.id)) if c.id is not None else {},
                     "news_metric": normalized_news_metric,
                 }
-                key = (int(c.id), str(code))
+                key = (symbol, market, str(code))
                 row = existing.get(key)
                 if not row:
                     row = StrategySignalRun(
                         snapshot_date=snapshot,
-                        stock_symbol=c.stock_symbol,
+                        stock_symbol=symbol,
                         stock_market=market,
-                        stock_name=c.stock_name or c.stock_symbol,
+                        stock_name=c.stock_name or symbol,
                         strategy_code=code,
                         source_candidate_id=c.id,
                     )
                     db.add(row)
                     existing[key] = row
 
+                # 每次写入都强制对齐身份字段，防止候选 ID 复用后串票。
+                row.stock_symbol = symbol
+                row.stock_market = market
+                row.stock_name = c.stock_name or symbol
+                row.source_candidate_id = c.id
                 row.strategy_name = strategy_name
                 row.strategy_version = strategy_version
                 row.risk_level = risk_level
@@ -1391,7 +1622,23 @@ def refresh_strategy_signals(
                 touched_keys.add(key)
                 touched_rows.append(row)
 
+        _normalize_actionable_rank(rows=touched_rows)
+        news_stats = _apply_direct_news_constraint(rows=touched_rows)
         constraint_stats = _apply_portfolio_constraints(rows=touched_rows)
+        if news_stats.get("demoted", 0) > 0:
+            logger.info(
+                "[策略层] 直接新闻约束: snapshot=%s demoted=%s",
+                snapshot,
+                news_stats.get("demoted", 0),
+            )
+            constraint_stats = {
+                "demoted": int(constraint_stats.get("demoted", 0))
+                + int(news_stats.get("demoted", 0)),
+                "by_reason": {
+                    **(constraint_stats.get("by_reason") or {}),
+                    **(news_stats.get("by_reason") or {}),
+                },
+            }
         if constraint_stats.get("demoted", 0) > 0:
             logger.info(
                 "[策略层] 组合约束生效: snapshot=%s demoted=%s details=%s",
@@ -1400,7 +1647,7 @@ def refresh_strategy_signals(
                 constraint_stats.get("by_reason", {}),
             )
 
-        # Remove stale strategy rows for same candidate snapshot when strategy mapping changed.
+        # Remove stale strategy rows for same snapshot when strategy mapping changed.
         stale_ids = [
             int(row.id)
             for key, row in existing.items()
@@ -1408,7 +1655,7 @@ def refresh_strategy_signals(
         ]
         if stale_ids:
             db.query(StrategySignalRun).filter(
-                StrategySignalRun.id.in_(stale_ids)
+                StrategySignalRun.id.in_(sorted(set(stale_ids)))
             ).delete(synchronize_session=False)
 
         db.commit()
@@ -1457,6 +1704,24 @@ def refresh_strategy_signals(
         db.close()
 
 
+def _dedupe_signal_rows(rows: list[StrategySignalRun]) -> tuple[list[StrategySignalRun], dict[tuple[str, str], list[str]]]:
+    """同一股票只留排名最高的一行，并记下折叠掉的策略代码。"""
+    best: dict[tuple[str, str], StrategySignalRun] = {}
+    codes: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        key = (
+            (row.stock_market or "CN").strip().upper() or "CN",
+            (row.stock_symbol or "").strip(),
+        )
+        code = (row.strategy_code or "").strip()
+        bucket = codes.setdefault(key, [])
+        if code and code not in bucket:
+            bucket.append(code)
+        if key not in best:
+            best[key] = row
+    return list(best.values()), codes
+
+
 def list_strategy_signals(
     *,
     market: str = "",
@@ -1469,6 +1734,7 @@ def list_strategy_signals(
     strategy_code: str = "",
     risk_level: str = "",
     include_payload: bool = False,
+    dedupe_symbol: bool = True,
 ) -> dict:
     ensure_strategy_catalog()
     db = SessionLocal()
@@ -1485,9 +1751,12 @@ def list_strategy_signals(
             return {"snapshot_date": "", "count": 0, "items": []}
 
         q = db.query(StrategySignalRun).filter(StrategySignalRun.snapshot_date == snapshot)
-        mkt = (market or "").strip().upper()
-        if mkt:
-            q = q.filter(StrategySignalRun.stock_market == mkt)
+        from src.modules.strategy.opportunity_markets import resolve_opportunity_market_query
+
+        allowed = resolve_opportunity_market_query(market)
+        if allowed is None:
+            return {"snapshot_date": snapshot, "count": 0, "items": []}
+        q = q.filter(StrategySignalRun.stock_market.in_(allowed))
         st = (status or "").strip().lower()
         if st and st != "all":
             q = q.filter(StrategySignalRun.status == st)
@@ -1512,6 +1781,11 @@ def list_strategy_signals(
             q = q.filter(StrategySignalRun.risk_level == r)
 
         q = q.filter(StrategySignalRun.rank_score >= float(min_score or 0))
+        page_limit = max(1, int(limit))
+        fetch_limit = page_limit
+        collapse = bool(dedupe_symbol) and not scode
+        if collapse:
+            fetch_limit = min(2000, page_limit * 8)
         rows = (
             q.order_by(
                 case(
@@ -1522,9 +1796,13 @@ def list_strategy_signals(
                 StrategySignalRun.rank_score.desc(),
                 StrategySignalRun.updated_at.desc(),
             )
-            .limit(max(1, int(limit)))
+            .limit(fetch_limit)
             .all()
         )
+        sibling_codes: dict[tuple[str, str], list[str]] = {}
+        if collapse:
+            rows, sibling_codes = _dedupe_signal_rows(rows)
+            rows = rows[:page_limit]
         factor_map: dict[int, StrategyFactorSnapshot] = {}
         if rows and not include_payload:
             ids = [int(x.id) for x in rows if x.id is not None]
@@ -1543,6 +1821,13 @@ def list_strategy_signals(
                 x,
                 include_payload=include_payload,
                 factor_snapshot=factor_map.get(int(x.id)) if (x.id is not None) else None,
+                sibling_strategy_codes=sibling_codes.get(
+                    (
+                        (x.stock_market or "CN").strip().upper() or "CN",
+                        (x.stock_symbol or "").strip(),
+                    ),
+                    [],
+                ),
             )
             for x in rows
         ]
@@ -2199,9 +2484,12 @@ def list_market_regime_snapshots(
         snap = (snapshot_date or "").strip()
         if snap:
             q = q.filter(MarketRegimeSnapshot.snapshot_date == snap)
-        mkt = (market or "").strip().upper()
-        if mkt:
-            q = q.filter(MarketRegimeSnapshot.market == mkt)
+        from src.modules.strategy.opportunity_markets import resolve_opportunity_market_query
+
+        allowed = resolve_opportunity_market_query(market)
+        if allowed is None:
+            return {"count": 0, "items": []}
+        q = q.filter(MarketRegimeSnapshot.market.in_(allowed))
         rows = (
             q.order_by(
                 MarketRegimeSnapshot.snapshot_date.desc(),
@@ -2248,9 +2536,12 @@ def list_portfolio_risk_snapshots(
         snap = (snapshot_date or "").strip()
         if snap:
             q = q.filter(PortfolioRiskSnapshot.snapshot_date == snap)
-        mkt = (market or "").strip().upper()
-        if mkt:
-            q = q.filter(PortfolioRiskSnapshot.market == mkt)
+        from src.modules.strategy.opportunity_markets import resolve_opportunity_market_query
+
+        allowed = resolve_opportunity_market_query(market)
+        if allowed is None:
+            return {"count": 0, "items": []}
+        q = q.filter(PortfolioRiskSnapshot.market.in_(allowed))
         rows = (
             q.order_by(
                 PortfolioRiskSnapshot.snapshot_date.desc(),

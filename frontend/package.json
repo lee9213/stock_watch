@@ -31,6 +31,7 @@
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
     "date-fn": "^0.0.2",
+    "echarts": "5",
     "html-to-image": "^1.11.13",
     "i18next": "^26.4.2",
     "lucide-react": "^0.300.0",

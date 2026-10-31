@@ -1,8 +1,8 @@
-"""快讯(7×24)vendor:cls(财联社)/ sina(新浪直播)/ eastmoney(东财快讯),均市场级、单源。
+"""快讯(7×24)vendor:cls / sina / eastmoney / ths(同花顺),均市场级、单源。
 
-三家均为未公开文档的私有接口,字段以浏览器抓包常见键名为准,未文档化字段
-(cls 的 level/stock_list、sina 的 ext.stocks)一律用防御性 .get() + 缺失填默认,
-避免上游改字段导致硬失败。**待实抓校准**(沙箱代理拦截,无法验证真实响应结构)。
+均为未公开文档的私有接口,字段以浏览器抓包常见键名为准,未文档化字段
+(cls 的 level/stock_list、sina 的 ext.stocks、ths 的 stock 列表)一律用防御性
+.get() + 缺失填默认,避免上游改字段导致硬失败。
 
 时间统一走 datetime.fromtimestamp(ts, tz=timezone.utc) 或防御解析字符串;
 解析失败一律回退到 EPOCH(1970-01-01 UTC),绝不用无参 datetime.now()/time.time(),
@@ -309,6 +309,101 @@ class EastmoneyFlashNewsVendor(_FlashNewsVendorBase):
                         symbols=[],
                         importance=0,
                         url="",
+                    )
+                )
+            except Exception:
+                continue
+        return result
+
+
+# ---------------------------------------------------------------------------
+# ths(同花顺财经快讯)—— 与 PanWatch 事件驱动新闻流同源接口
+# ---------------------------------------------------------------------------
+
+_THS_URL = "https://news.10jqka.com.cn/tapp/news/push/stock/"
+_THS_HOST = "news.10jqka.com.cn"
+
+
+def _ths_stock_code(item: dict) -> str:
+    for key in ("stockCode", "stock_code", "code", "stockcode", "symbol", "stockMarketCode"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _ths_symbols(raw: dict) -> list[str]:
+    rows = raw.get("stock") or raw.get("stocks") or raw.get("code_list") or []
+    if not isinstance(rows, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        code = _ths_stock_code(entry)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+class ThsFlashNewsVendor(_FlashNewsVendorBase):
+    """同花顺 7×24 股票快讯(免 key),作财联社/新浪/东财之后的备源。"""
+
+    name = "ths"
+    supports_markets = {"CN"}
+
+    def fetch(self, symbols: list[Symbol], config: dict) -> list[FlashNews]:
+        limit = max(1, min(int((config or {}).get("days") or 50), 100))
+        headers = {
+            "User-Agent": _UA,
+            "Host": _THS_HOST,
+            "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.8,en-US;q=0.3,en;q=0.2",
+            "Referer": "https://news.10jqka.com.cn/",
+        }
+        data = market_get(
+            _THS_URL,
+            host_key=_THS_HOST,
+            min_interval_s=0.3,
+            params={"page": 1, "tag": "", "track": "website", "pagesize": limit},
+            headers=headers,
+            parse="json",
+            retries=2,
+            timeout=8,
+            log_label="同花顺快讯",
+        )
+        if not data:
+            return []
+
+        items = ((data or {}).get("data") or {}).get("list") or []
+        result: list[FlashNews] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                title = str(item.get("title") or item.get("short") or "").strip()
+                content = str(item.get("digest") or item.get("content") or title).strip()
+                if not title and not content:
+                    continue
+                publish_time = _EPOCH
+                for key in ("ctime", "rtime", "mtime"):
+                    if item.get(key) not in (None, "", 0, "0"):
+                        publish_time = _parse_epoch_seconds(item.get(key))
+                        break
+                url = str(item.get("url") or item.get("shareUrl") or item.get("shareurl") or "").strip()
+                result.append(
+                    FlashNews(
+                        source="ths",
+                        external_id=str(item.get("id") or item.get("seq") or ""),
+                        title=title or content,
+                        content=content,
+                        publish_time=publish_time,
+                        symbols=_ths_symbols(item),
+                        importance=0,
+                        url=url,
                     )
                 )
             except Exception:

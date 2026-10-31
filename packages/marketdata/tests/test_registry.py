@@ -11,11 +11,11 @@ from marketdata.registry import VENDOR_CLASSES_BY_TYPE, build_vendors
 def test_package_vendors_by_type_content():
     """内容必须与 client.py 现状(quote/kline/capital_flow/events 各 vendor)完全一致。"""
     assert PACKAGE_VENDORS_BY_TYPE == {
-        "quote": frozenset({"tencent", "sina", "eastmoney", "yfinance"}),
-        "kline": frozenset({"tencent", "stooq", "eastmoney", "yahoo"}),
+        "quote": frozenset({"tencent", "sina", "eastmoney", "ths", "yfinance"}),
+        "kline": frozenset({"tencent", "stooq", "eastmoney", "ths", "yahoo"}),
         "capital_flow": frozenset({"eastmoney", "sina"}),
         "events": frozenset({"eastmoney"}),
-        "flash_news": frozenset({"cls", "sina", "eastmoney"}),
+        "flash_news": frozenset({"cls", "sina", "eastmoney", "ths"}),
         "news": frozenset({"xueqiu", "eastmoney_news", "eastmoney"}),
         "fundamentals": frozenset({"tencent", "eastmoney"}),
         "dragon_tiger": frozenset({"eastmoney"}),

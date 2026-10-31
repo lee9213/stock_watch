@@ -77,7 +77,9 @@ class PriceAlertScheduler:
         )
         self.scheduler.start()
         from src.platform.scheduling.scheduler_registry import register
+        from src.platform.scheduling.job_manager import apply_configs_to_scheduler
         register("price_alert", self.scheduler)
+        apply_configs_to_scheduler("price_alert", self.scheduler, timezone=str(self.scheduler.timezone))
         logger.info(f"价格提醒调度器已启动，扫描间隔 {self.interval_seconds}s")
 
     def shutdown(self):

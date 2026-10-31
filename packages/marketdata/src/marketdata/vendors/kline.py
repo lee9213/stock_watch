@@ -1,8 +1,12 @@
-"""K 线 vendors:腾讯(全市场)/ Stooq(US)/ 东财(CN/HK)/ Yahoo(US/HK)。移植自 PanWatch kline_collector 抓取核。"""
+"""K 线 vendors:腾讯(全市场)/ Stooq(US)/ 东财(CN/HK)/ 同花顺(CN)/ Yahoo(US/HK)。
+
+移植自 PanWatch kline_collector 抓取核;同花顺为 A 股第三源。
+"""
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from marketdata.http import market_get
@@ -16,6 +20,18 @@ _TENCENT_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 _EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _STOOQ_URL = "https://stooq.com/q/d/l/"
 _YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+_THS_LINE_URL = "https://d.10jqka.com.cn/v6/line/hs_{code}/01/{slice}.js"
+_THS_HOST = "d.10jqka.com.cn"
+_THS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://q.10jqka.com.cn/",
+    "Accept": "*/*",
+}
+_THS_JSONP_RE = re.compile(r"\((\{.*\})\)\s*$", re.S)
 
 
 def _days(config: dict, default: int = 60) -> int:
@@ -192,6 +208,110 @@ class EastmoneyKlineVendor(KlineVendor):
             return []
         days = _days(config)
         return fetch_eastmoney_kline(_em_secid(sym), days)
+
+
+def _ths_parse_jsonp(text: str) -> dict | None:
+    stripped = (text or "").strip()
+    match = _THS_JSONP_RE.search(stripped)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ths_norm_date(raw: str) -> str:
+    text = (raw or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def _ths_parse_data_rows(data_blob: object) -> list[Bar]:
+    """同花顺日K行:`日期,开,高,低,收,量,额,...`(与腾讯/东财的 开收高低 顺序不同)。"""
+    if not isinstance(data_blob, str) or not data_blob.strip():
+        return []
+    out: list[Bar] = []
+    for row in data_blob.split(";"):
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) < 6 or not parts[0]:
+            continue
+        try:
+            out.append(
+                Bar(
+                    date=_ths_norm_date(parts[0]),
+                    open=float(parts[1]),
+                    high=float(parts[2]),
+                    low=float(parts[3]),
+                    close=float(parts[4]),
+                    volume=float(parts[5]) if parts[5] else 0.0,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ths_get_slice(code: str, slice_name: str) -> dict | None:
+    text = market_get(
+        _THS_LINE_URL.format(code=code, slice=slice_name),
+        host_key=_THS_HOST,
+        min_interval_s=0.25,
+        headers=_THS_HEADERS,
+        timeout=12,
+        retries=2,
+        parse="text",
+        log_label="同花顺K线",
+        symbol=code,
+    )
+    if not text:
+        return None
+    return _ths_parse_jsonp(text if isinstance(text, str) else str(text))
+
+
+def fetch_ths_kline(code: str, days: int) -> list[Bar]:
+    """同花顺 A 股日K:`last.js` 取近约 140 根;不足再按 year 字典补年片。"""
+    want = max(1, int(days or 60))
+    last_payload = _ths_get_slice(code, "last")
+    if not last_payload:
+        return []
+    by_date: dict[str, Bar] = {}
+    for bar in _ths_parse_data_rows(last_payload.get("data")):
+        by_date[bar.date] = bar
+
+    year_map = last_payload.get("year") if isinstance(last_payload.get("year"), dict) else {}
+    if len(by_date) < want and year_map:
+        years = sorted((int(y) for y in year_map.keys() if str(y).isdigit()), reverse=True)
+        for year in years:
+            if len(by_date) >= want:
+                break
+            year_payload = _ths_get_slice(code, str(year))
+            if not year_payload:
+                continue
+            for bar in _ths_parse_data_rows(year_payload.get("data")):
+                by_date[bar.date] = bar
+
+    out = sorted(by_date.values(), key=lambda b: b.date)
+    if want > 0 and len(out) > want:
+        out = out[-want:]
+    return out
+
+
+class ThsKlineVendor(KlineVendor):
+    """同花顺日K,A 股第三源(腾讯 → 东财 → 同花顺)。"""
+
+    name = "ths"
+    supports_markets = {"CN"}
+
+    def fetch(self, symbols: list[Symbol], config: dict) -> list[Bar]:
+        if not symbols:
+            return []
+        sym = symbols[0]
+        if sym.market != Market.CN:
+            return []
+        return fetch_ths_kline(sym.code, _days(config))
 
 
 def _yahoo_range(days: int) -> str:

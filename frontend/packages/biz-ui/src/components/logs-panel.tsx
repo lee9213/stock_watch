@@ -1,7 +1,6 @@
 import { useConfirm } from '@panwatch/base-ui/components/ui/confirm-dialog'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { Search, Trash2, RefreshCw, ScrollText, ChevronDown } from 'lucide-react'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@panwatch/base-ui/components/ui/dialog'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { fetchAPI, subscribeSSE } from '@panwatch/api'
@@ -78,7 +77,7 @@ function unique(arr: string[]) {
   return Array.from(new Set(arr.filter(Boolean)))
 }
 
-export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpenChange: (v: boolean) => void }) {
+export default function LogsPanel() {
   const { t, i18n } = useTranslation('bizUi')
   const confirmAction = useConfirm()
   const tr = (key: string, options?: Record<string, unknown>) =>
@@ -159,17 +158,16 @@ export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpe
     void load({ append: false, cursor: 0 })
   }, [load])
 
-  // 初次打开或筛选变更时刷新（关键词搜索走防抖）
+  // 进入页面或筛选变更时刷新（关键词搜索走防抖）
   useEffect(() => {
-    if (!open) return
     loadLatest()
     // query 由 handleSearchInput 防抖触发，避免每次键入都立即请求。
-  }, [open, selectedLevels, selectedLoggers, selectedFlow, domain, timeRange])
+  }, [selectedLevels, selectedLoggers, selectedFlow, domain, timeRange])
 
   // 自动刷新：优先 SSE tail（服务端推增量，事件 id 即日志 id，断线自动续推），
   // SSE 不可用/关流时降级为原 3s 轮询（轮询代码保留兜底）
   useEffect(() => {
-    if (!(open && autoRefresh)) {
+    if (!autoRefresh) {
       return () => { if (refreshTimer.current) clearInterval(refreshTimer.current) }
     }
 
@@ -211,7 +209,7 @@ export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpe
       close()
       if (refreshTimer.current) clearInterval(refreshTimer.current)
     }
-  }, [open, autoRefresh, loadLatest, selectedLevels, effectiveLoggers, query, domain, timeRange])
+  }, [autoRefresh, loadLatest, selectedLevels, effectiveLoggers, query, domain, timeRange])
 
   const handleSearchInput = (value: string) => {
     setQuery(value)
@@ -275,11 +273,15 @@ export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpe
   const loggerFilterOptions = loggerOptions(language)
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[90vw] max-w-[90vw] h-[90vh] max-h-[90vh] flex flex-col overflow-hidden" onInteractOutside={(e) => e.preventDefault()}>
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <span>{tr('title')}</span>
+    <div className="flex h-full min-h-0 flex-col">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary/70 shadow-sm">
+              <ScrollText className="h-5 w-5 text-white" />
+            </div>
+            <h1 className="text-[20px] font-bold tracking-tight text-foreground md:text-[22px]">{tr('title')}</h1>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
             <Button variant={autoRefresh ? 'default' : 'secondary'} size="sm" className="h-7" onClick={() => setAutoRefresh(v => !v)}>
               <RefreshCw className={`w-3.5 h-3.5 ${autoRefresh ? 'animate-spin' : ''}`} />
               {tr('autoRefresh')}
@@ -287,11 +289,11 @@ export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpe
             <Button variant="outline" size="sm" className="h-7" onClick={loadLatest}>
               {tr('refresh')}
             </Button>
-            <Button variant="ghost" size="sm" className="h-7 hover:text-destructive hover:bg-destructive/8 ml-auto" onClick={handleClear}>
+            <Button variant="ghost" size="sm" className="h-7 hover:text-destructive hover:bg-destructive/8" onClick={handleClear}>
               <Trash2 className="w-3.5 h-3.5" /> {tr('clear')}
             </Button>
-          </DialogTitle>
-        </DialogHeader>
+          </div>
+        </div>
 
         <div className="card p-3 md:p-4 mb-3 space-y-3">
           <div className="relative">
@@ -447,7 +449,6 @@ export default function LogsModal({ open, onOpenChange }: { open: boolean, onOpe
             </div>
           )}
         </div>
-      </DialogContent>
-    </Dialog>
+    </div>
   )
 }

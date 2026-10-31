@@ -12,7 +12,7 @@ Element.prototype.matches = function (selector: string) {
 
 beforeEach(async () => {
   await i18nReady
-  await i18n.loadNamespaces(['common', 'auth', 'navigation', 'settings', 'configuration', 'bizUi'])
+  await i18n.loadNamespaces(['common', 'auth', 'navigation', 'settings', 'configuration', 'bizUi', 'newsFlow', 'tokenUsage'])
   window.localStorage.removeItem('panwatch-locale')
   await i18n.changeLanguage('zh-CN')
 })

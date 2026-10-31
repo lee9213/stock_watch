@@ -27,6 +27,11 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 SQLITE_INIT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
+def _json_serializer(value) -> str:
+    """JSON 落库保留中文原文，避免 Navicat/人工查库看到 \\uXXXX 伪乱码。"""
+    return json.dumps(value, ensure_ascii=False)
+
+
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
     echo=False,
@@ -35,6 +40,7 @@ engine = create_engine(
         "check_same_thread": False,
     },
     poolclass=NullPool,
+    json_serializer=_json_serializer,
 )
 
 

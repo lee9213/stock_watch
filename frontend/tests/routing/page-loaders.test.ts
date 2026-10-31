@@ -10,12 +10,16 @@ describe('route page loaders', () => {
       'gettingStarted',
       'stocks',
       'opportunities',
+      'newsFlow',
       'paperTrading',
       'assistant',
       'alerts',
       'agents',
       'evaluations',
       'history',
+      'schedulerHistory',
+      'logs',
+      'tokenUsage',
       'dataSources',
       'settings',
       'analysisDetail',
@@ -33,5 +37,12 @@ describe('route page loaders', () => {
 
   it('resolves the recoverable setup page', () => {
     expect(resolveRouteKey('/getting-started')).toBe('gettingStarted')
+  })
+
+  it('resolves event-driven news flow and logs pages', () => {
+    expect(resolveRouteKey('/news-flow')).toBe('newsFlow')
+    expect(resolveRouteKey('/scheduler-history')).toBe('schedulerHistory')
+    expect(resolveRouteKey('/logs')).toBe('logs')
+    expect(resolveRouteKey('/token-usage')).toBe('tokenUsage')
   })
 })

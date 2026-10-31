@@ -241,8 +241,11 @@ class FailoverAIClient:
         messages: list[dict],
         temperature: float | None = 0.4,
         max_tokens: int | None = None,
+        **extra,
     ) -> str:
-        kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
+        kwargs = dict(extra)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         return await self._run(
             "chat_multi", messages, temperature=temperature, **kwargs
         )
@@ -308,8 +311,21 @@ class FailoverAIClient:
         raise last_exc or RuntimeError("所有候选模型均失败(流式)")
 
 
-def _make_client(base_url: str, api_key: str, model: str, proxy: str) -> AIClient:
-    return AIClient(base_url=base_url, api_key=api_key, model=model, proxy=proxy)
+def _make_client(
+    base_url: str,
+    api_key: str,
+    model: str,
+    proxy: str,
+    *,
+    platform: str = "",
+) -> AIClient:
+    return AIClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        proxy=proxy,
+        platform=platform,
+    )
 
 
 def build_failover_client(
@@ -347,6 +363,7 @@ def build_failover_client(
                     primary_service.api_key,
                     primary_model.model,
                     proxy,
+                    platform=str(getattr(primary_service, "name", "") or ""),
                 ),
                 f"{primary_service.name}/{primary_model.model}",
             )
@@ -356,7 +373,7 @@ def build_failover_client(
         s = settings or Settings()
         candidates.append(
             (
-                _make_client(s.ai_base_url, s.ai_api_key, s.ai_model, proxy),
+                _make_client(s.ai_base_url, s.ai_api_key, s.ai_model, proxy, platform="env"),
                 f"env/{s.ai_model}",
             )
         )
@@ -386,7 +403,13 @@ def build_failover_client(
                 continue
             candidates.append(
                 (
-                    _make_client(svc.base_url, svc.api_key, m.model, proxy),
+                    _make_client(
+                        svc.base_url,
+                        svc.api_key,
+                        m.model,
+                        proxy,
+                        platform=str(svc.name or ""),
+                    ),
                     f"{svc.name}/{m.model}",
                 )
             )

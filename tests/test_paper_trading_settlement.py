@@ -27,6 +27,8 @@ from src.platform.persistence.models import (
 )
 from src.platform.scheduling import trading_calendar as calendar
 
+NEWS_PAYLOAD = {"news_metric": {"news_count": 1, "direct_news_count": 1, "event_tier": "medium"}}
+
 
 def local(market, day, hour=10):
     return datetime.fromisoformat(f"{day}T{hour:02d}:00:00").replace(
@@ -101,7 +103,7 @@ def test_cash_account_same_day_sale_blocks_reuse_until_due(monkeypatch, storage,
         engine._close_position(db, account, db.get(PaperTradingPosition, ident), 12, "manual")
         db.add(StrategySignalRun(stock_symbol="NEW", stock_market=market, status="active",
             strategy_code="trend_follow", snapshot_date="2026-10-09", action="buy",
-            rank_score=90, entry_low=10, entry_high=10))
+            rank_score=90, entry_low=10, entry_high=10, payload=NEWS_PAYLOAD))
         db.commit()
         cash_after_sale, pnl_after_sale = account.current_capital, account.total_pnl
         row = db.query(PaperTradingSettlement).one()
@@ -120,6 +122,10 @@ def test_cash_account_same_day_sale_blocks_reuse_until_due(monkeypatch, storage,
     assert engine._scan_sync()["opened"] == 0
     # A new engine/session simulates restart and catches up the persisted ledger.
     freeze(monkeypatch, local(market, "2026-10-13"))
+    # Keep the waiting signal within the freshness window; this test is about settlement.
+    with storage() as db:
+        db.query(StrategySignalRun).filter_by(stock_symbol="NEW").update({"snapshot_date": "2026-10-13"})
+        db.commit()
     resumed = engine_module.PaperTradingEngine()
     monkeypatch.setattr(resumed, "_fetch_quotes_map", lambda pairs: {(market, "NEW"): {"current_price": 10}})
     result = resumed._scan_sync()
@@ -147,7 +153,7 @@ def test_cn_proceeds_reused_without_unlocking_new_shares(monkeypatch, storage):
         engine._close_position(db, account, db.get(PaperTradingPosition, ident), 12, "manual")
         db.add(StrategySignalRun(stock_symbol="NEW", stock_market="CN", status="active",
             strategy_code="trend_follow", snapshot_date="2026-10-09", action="buy",
-            rank_score=90, entry_low=10, entry_high=10))
+            rank_score=90, entry_low=10, entry_high=10, payload=NEWS_PAYLOAD))
         db.commit()
     monkeypatch.setattr(engine, "_fetch_quotes_map", lambda pairs: {("CN", "NEW"): {"current_price": 10}})
     assert engine._scan_sync()["opened"] == 1
@@ -265,6 +271,8 @@ def test_unallocated_reserve_and_notifications_share_the_buying_limit(storage):
 
 def test_one_scan_cannot_spend_shared_cash_in_two_markets(monkeypatch, storage):
     freeze(monkeypatch, local("CN", "2026-10-09"))
+    # Only the shared-cash guard is under test; the 80% exposure cap would block this tiny account first.
+    monkeypatch.setattr(engine_module, "MAX_TOTAL_EXPOSURE", 1.0)
     with storage() as db:
         old = PaperTradingPosition(stock_symbol="OLD", stock_market="US", quantity=350,
             entry_price=10, current_price=10, highest_price=10, status="open")
@@ -275,7 +283,7 @@ def test_one_scan_cannot_spend_shared_cash_in_two_markets(monkeypatch, storage):
         for market in ["CN", "HK"]:
             db.add(StrategySignalRun(stock_symbol="NEW", stock_market=market, status="active",
                 strategy_code="trend_follow", action="buy", rank_score=90,
-                entry_low=10, entry_high=10, snapshot_date="2026-10-09"))
+                entry_low=10, entry_high=10, snapshot_date="2026-10-09", payload=NEWS_PAYLOAD))
         db.commit()
     engine = engine_module.PaperTradingEngine()
     monkeypatch.setattr(engine, "_fetch_quotes_map", lambda pairs: {

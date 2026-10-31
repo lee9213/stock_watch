@@ -12,7 +12,7 @@ def _isolate_startup(monkeypatch, server):
     initialization = []
     for name in (
         "init_db", "setup_logging", "setup_proxy", "setup_ssl", "setup_playwright",
-        "seed_agents", "seed_strategies", "seed_sample_stocks", "reconcile_data_sources",
+        "seed_agents", "seed_strategies", "seed_table_comments", "reconcile_data_sources",
         "register_mcp_log_cleanup", "warmup_javascript_runtime",
     ):
         monkeypatch.setattr(server, name, Mock(side_effect=lambda *args, _name=name, **kwargs: initialization.append(_name)))
@@ -26,11 +26,11 @@ def _isolate_startup(monkeypatch, server):
         Mock(side_effect=lambda db: initialization.append("recover_interrupted_analysis")),
     )
     monkeypatch.setattr(server, "Settings", lambda: SimpleNamespace(app_timezone="Asia/Shanghai"))
-    schedulers = [Mock() for _ in range(4)]
+    schedulers = [Mock() for _ in range(5)]
     monkeypatch.setattr(server, "build_scheduler", lambda: schedulers[0])
-    for index, name in enumerate(("PriceAlertScheduler", "PaperTradingScheduler", "ContextMaintenanceScheduler"), start=1):
+    for index, name in enumerate(("PriceAlertScheduler", "PaperTradingScheduler", "ContextMaintenanceScheduler", "NewsFlowScheduler"), start=1):
         monkeypatch.setattr(server, name, lambda _index=index, **kwargs: schedulers[_index])
-    for name in ("scheduler", "price_alert_scheduler", "paper_trading_scheduler", "context_maintenance_scheduler"):
+    for name in ("scheduler", "price_alert_scheduler", "paper_trading_scheduler", "context_maintenance_scheduler", "news_flow_scheduler"):
         monkeypatch.setattr(server, name, None)
     import threading
     from src.modules.administration.api import auth
@@ -75,7 +75,7 @@ def test_production_lifespan_recovers_tasks_once_and_dispatches_shutdown(monkeyp
     monkeypatch.setattr(assistant_task_runner, "start_message", lambda task_id, cid: started.append((task_id, cid)))
 
     def startup_probe():
-        assert "init_db" in initialization and "seed_sample_stocks" in initialization
+        assert "init_db" in initialization and "seed_strategies" in initialization
         assert initialization.count("recover_interrupted_analysis") == 1
         assert initialization.index("init_db") < initialization.index("recover_interrupted_analysis") < initialization.index("setup_logging")
         startup_calls.append(True)

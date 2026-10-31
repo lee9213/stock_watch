@@ -378,13 +378,13 @@ class MarketData:
         return self.metrics.snapshot()
 
     def hot_stocks(self, **kw) -> list[HotStock]:
-        """热门/异动股(东财榜单,市场级、不经 Engine)。"""
+        """热门/异动股(市场级、不经 Engine)。东财多主机失败后自动切新浪/同花顺/人气榜。"""
         return self._discovery.hot_stocks(**kw)
 
     def hot_boards(self, **kw) -> list[HotBoard]:
-        """热门板块(东财榜单,市场级、不经 Engine)。"""
+        """热门板块(市场级、不经 Engine)。东财多主机自动换源。"""
         return self._discovery.hot_boards(**kw)
 
     def board_stocks(self, **kw) -> list[HotStock]:
-        """板块成分股榜单(东财,市场级、不经 Engine)。"""
+        """板块成分股榜单(市场级、不经 Engine)。东财多主机自动换源。"""
         return self._discovery.board_stocks(**kw)

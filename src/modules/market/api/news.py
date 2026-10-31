@@ -1,15 +1,27 @@
 """新闻 API - 基于数据源配置"""
+import logging
+import time
+
 from src.web.datetime import as_utc
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from src.platform.persistence.database import get_db
 from src.platform.persistence.models import Stock, DataSource
 from src.platform.marketdata.collectors.news_collector import NewsCollector, NewsItem
+from src.modules.market import news_flow
+from src.modules.market.news_digest_job import (
+    acquire_refresh_lock,
+    build_news_digest,
+    digest_payload,
+    release_refresh_lock,
+)
+from src.modules.market.news_store import recent_digests
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # 来源显示名称
 SOURCE_LABELS = {
@@ -153,3 +165,86 @@ def get_news_sources(db: Session = Depends(get_db)):
         }
         for ds in data_sources
     ]
+
+
+@router.get("/flow/topics")
+def get_news_flow_topics(db: Session = Depends(get_db)):
+    """事件驱动页左侧话题：固定列表 + 近 24 小时高频标签。"""
+    return {"items": news_flow.topic_items(db)}
+
+
+@router.get("/flow/digest")
+def get_news_flow_digest(db: Session = Depends(get_db)):
+    """事件驱动页顶部速览：读库中最新一条小时级 LLM 快照。"""
+    return digest_payload(db)
+
+
+@router.get("/flow/digest/history")
+def get_news_flow_digest_history(
+    limit: int = Query(24, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    return recent_digests(db, limit=limit)
+
+
+@router.post("/flow/digest/refresh")
+async def refresh_news_flow_digest(db: Session = Depends(get_db)):
+    """手动立即生成一条速览（消耗默认模型额度，2 分钟冷却）。"""
+    waiting = acquire_refresh_lock()
+    if waiting is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"刷新过于频繁，请 {waiting} 秒后再试",
+            headers={"Retry-After": str(waiting)},
+        )
+    started = time.monotonic()
+    logger.info("事件驱动速览开始手动刷新")
+    try:
+        saved = await build_news_digest(trigger_type="manual", force=True)
+    except Exception:
+        release_refresh_lock()
+        logger.exception("事件驱动速览刷新异常")
+        raise HTTPException(status_code=500, detail="生成失败，请查看服务日志")
+    if not saved:
+        release_refresh_lock()
+        logger.warning("事件驱动速览刷新未产出结果，耗时 %.1fs", time.monotonic() - started)
+        raise HTTPException(status_code=503, detail="暂时没有足够的新新闻可供总结，请稍后再试")
+    logger.info("事件驱动速览刷新完成，耗时 %.1fs", time.monotonic() - started)
+    payload = digest_payload(db)
+    payload["digest"] = saved
+    return payload
+
+
+@router.post("/flow/ingest")
+async def ingest_news_flow_now():
+    """手动立即采集三源快讯，新入库条目直接送分析队列（60 秒冷却）。"""
+    from src.modules.market.news_flow_scheduler import get_active_scheduler
+
+    sched = get_active_scheduler()
+    if sched is None:
+        raise HTTPException(status_code=503, detail="事件驱动调度器未启动")
+    result = await sched.ingest_now()
+    status = result.get("status")
+    if status == "cooldown":
+        waiting = int(result.get("retry_after") or 1)
+        raise HTTPException(
+            status_code=429,
+            detail=f"采集过于频繁，请 {waiting} 秒后再试",
+            headers={"Retry-After": str(waiting)},
+        )
+    if status == "busy":
+        raise HTTPException(status_code=409, detail="正在采集中，请稍后刷新")
+    if status == "failed":
+        raise HTTPException(status_code=502, detail="采集失败，请查看服务日志")
+    return result
+
+
+@router.get("/flow")
+def get_news_flow(
+    keyword: str = Query("", description="在摘要中匹配话题词；空或「全部新闻」不过滤"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """市场新闻分页，供事件驱动页使用。"""
+    return news_flow.search_news_flow(keyword=keyword, page=page, page_size=page_size, db=db)

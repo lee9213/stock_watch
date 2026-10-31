@@ -27,27 +27,29 @@ const LANGUAGE_OPTIONS: { value: SupportedLocale; labelKey: 'simplifiedChinese' 
 ]
 
 interface AccountMenuProps {
-  /** 原“更多”里折叠的导航项(Agent / 历史 / 数据源 / 设置)。 */
-  navItems: AccountNavItem[]
+  /** 侧栏已展示全部路由时可不传；仅用于兼容旧入口里的补充导航。 */
+  navItems?: AccountNavItem[]
   mode: ThemeMode
   onSetMode: (m: ThemeMode) => void
   /** 打开「系统自检」弹窗(状态由上层 App 托管,避免桌面/移动两个实例重复)。 */
   onOpenSelfCheck: () => void
   /** 头像尺寸:桌面 md,移动端 sm。 */
   size?: 'sm' | 'md'
+  /** 侧栏底部打开时菜单向右展开，避免被侧栏裁切。 */
+  menuPlacement?: 'toolbar' | 'sidebar'
 }
 
 /**
- * 右上角头像区域 + 下拉菜单(参考 beecount-cloud):
- * 把原“更多”导航、主题色(亮/暗/跟随系统)、退出登录收进头像下拉
- * (查看日志 / GitHub 仍在外侧)。
+ * 头像入口 + 下拉菜单：主题、语言、自检、退出。
+ * 主导航已改到左侧栏，不再把页面路由塞进头像菜单。
  */
 export default function AccountMenu({
-  navItems,
+  navItems = [],
   mode,
   onSetMode,
   onOpenSelfCheck,
   size = 'md',
+  menuPlacement = 'toolbar',
 }: AccountMenuProps) {
   const { t, i18n: i18nInstance } = useTranslation('settings')
   const currentLocale = normalizeLocale(i18nInstance.resolvedLanguage || i18nInstance.language)
@@ -99,29 +101,31 @@ export default function AccountMenu({
 
       {open && (
         // top-full + pt-2:用透明内边距桥接头像与菜单,hover 移入不断开
-        <div className="absolute right-0 top-full pt-2 z-50">
+        <div className={menuPlacement === 'sidebar' ? 'absolute bottom-0 left-full z-50 pl-2' : 'absolute right-0 top-full z-50 pt-2'}>
           <div className="w-56 rounded-xl border border-border/60 bg-card/95 backdrop-blur p-1.5 shadow-xl">
-          {/* 原“更多”导航 */}
-          {navItems.map(({ to, icon: Icon, label }) => {
-            const isActive = location.pathname.startsWith(to)
-            return (
-              <NavLink
-                key={to}
-                to={to}
-                onClick={() => setOpen(false)}
-                className={`flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[12px] transition-colors ${
-                  isActive
-                    ? 'bg-primary/10 text-primary'
-                    : 'text-muted-foreground hover:text-foreground hover:bg-accent/60'
-                }`}
-              >
-                <Icon className="w-3.5 h-3.5" />
-                {label}
-              </NavLink>
-            )
-          })}
-
-          <div className="my-1 h-px bg-border/50" />
+          {navItems.length > 0 ? (
+            <>
+              {navItems.map(({ to, icon: Icon, label }) => {
+                const isActive = location.pathname.startsWith(to)
+                return (
+                  <NavLink
+                    key={to}
+                    to={to}
+                    onClick={() => setOpen(false)}
+                    className={`flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[12px] transition-colors ${
+                      isActive
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent/60'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {label}
+                  </NavLink>
+                )
+              })}
+              <div className="my-1 h-px bg-border/50" />
+            </>
+          ) : null}
 
           {/* 主题色:亮 / 暗 / 跟随系统 */}
           <div className="px-2.5 pt-0.5 pb-1 text-[11px] text-muted-foreground">{t('account.themeTitle')}</div>

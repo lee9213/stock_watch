@@ -5,6 +5,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 from pan_agent_token_meter import normalize_provider_usage
 
+from src.platform.ai.usage_recorder import messages_to_input_text, record_llm_usage
 from src.platform.observability import otel
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,16 @@ logger = logging.getLogger(__name__)
 class AIClient:
     """OpenAI 协议兼容的 AI 客户端"""
 
-    def __init__(self, base_url: str, api_key: str, model: str = "", proxy: str = ""):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str = "",
+        proxy: str = "",
+        *,
+        platform: str = "",
+        scene: str = "",
+    ):
         kwargs = {
             "base_url": base_url,
             "api_key": api_key,
@@ -26,8 +36,30 @@ class AIClient:
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
+        self.platform = platform or ""
+        self.scene = scene or ""
         self.total_tokens_used = 0
         self.last_usage = None
+
+    def _persist_usage(self, usage, *, messages=None, output_text: str | None = None) -> None:
+        if not usage:
+            return
+        try:
+            self.last_usage = normalize_provider_usage(usage, model=self.model)
+            total = int(getattr(usage, "total_tokens", 0) or 0)
+            self.total_tokens_used += total
+            record_llm_usage(
+                model=self.model,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                total_tokens=total,
+                input_text=messages_to_input_text(messages) if messages is not None else None,
+                output_text=output_text,
+                scene=self.scene or None,
+                platform=self.platform or None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("token usage 回填失败", exc_info=True)
 
     async def chat(
         self,
@@ -70,21 +102,19 @@ class AIClient:
             # OTel gen_ai span(默认关闭时为 no-op);token 用量在拿到 usage 后回填。
             with otel.llm_span(self.model, operation="chat") as _span:
                 response = await self.client.chat.completions.create(**create_kwargs)
-                # 记录 token 用量
+                content = response.choices[0].message.content or ""
                 if response.usage:
-                    self.last_usage = normalize_provider_usage(response.usage, model=self.model)
-                    self.total_tokens_used += response.usage.total_tokens
                     _span.set_response(
                         model=getattr(response, "model", None) or self.model,
                         input_tokens=response.usage.prompt_tokens,
                         output_tokens=response.usage.completion_tokens,
                     )
+                    self._persist_usage(response.usage, messages=messages, output_text=content)
                     logger.debug(
                         f"Token usage: {response.usage.prompt_tokens} + "
                         f"{response.usage.completion_tokens} = {response.usage.total_tokens}"
                     )
-
-            return response.choices[0].message.content or ""
+            return content
 
         except Exception as e:
             logger.error(f"AI 调用失败: {e}")
@@ -95,6 +125,7 @@ class AIClient:
         messages: list[dict],
         temperature: float | None = 0.4,
         max_tokens: int | None = None,
+        **extra,
     ) -> str:
         """
         多轮对话：传入完整 messages 列表。
@@ -103,28 +134,29 @@ class AIClient:
             messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
             temperature: 生成温度；传 None 时不下发该参数
                 （用于 failover 对"参数不兼容"错误的摘参重试）
+            extra: 透传给 chat.completions.create 的额外参数（如 response_format）
         """
         try:
-            create_kwargs: dict = {"model": self.model, "messages": messages}
+            create_kwargs: dict = {"model": self.model, "messages": messages, **extra}
             if temperature is not None:
                 create_kwargs["temperature"] = temperature
             if max_tokens is not None:
                 create_kwargs["max_tokens"] = max_tokens
             with otel.llm_span(self.model, operation="chat") as _span:
                 response = await self.client.chat.completions.create(**create_kwargs)
+                content = response.choices[0].message.content or ""
                 if response.usage:
-                    self.last_usage = normalize_provider_usage(response.usage, model=self.model)
-                    self.total_tokens_used += response.usage.total_tokens
                     _span.set_response(
                         model=getattr(response, "model", None) or self.model,
                         input_tokens=response.usage.prompt_tokens,
                         output_tokens=response.usage.completion_tokens,
                     )
+                    self._persist_usage(response.usage, messages=messages, output_text=content)
                     logger.debug(
                         f"Token usage: {response.usage.prompt_tokens} + "
                         f"{response.usage.completion_tokens} = {response.usage.total_tokens}"
                     )
-            return response.choices[0].message.content or ""
+            return content
         except Exception as e:
             logger.error(f"AI 多轮对话调用失败: {e}")
             raise
@@ -149,15 +181,19 @@ class AIClient:
                 create_kwargs["temperature"] = temperature
             with otel.llm_span(self.model, operation="chat") as _span:
                 response = await self.client.chat.completions.create(**create_kwargs)
+                message = response.choices[0].message
                 if response.usage:
-                    self.last_usage = normalize_provider_usage(response.usage, model=self.model)
-                    self.total_tokens_used += response.usage.total_tokens
                     _span.set_response(
                         model=getattr(response, "model", None) or self.model,
                         input_tokens=response.usage.prompt_tokens,
                         output_tokens=response.usage.completion_tokens,
                     )
-            return response.choices[0].message
+                    self._persist_usage(
+                        response.usage,
+                        messages=messages,
+                        output_text=getattr(message, "content", None) or "",
+                    )
+            return message
         except Exception as e:
             logger.error(f"AI tool use 调用失败: {e}")
             raise
@@ -223,9 +259,7 @@ class AIClient:
             # 部分兼容服务会在末尾单发一个只含 usage 的 chunk
             usage = getattr(chunk, "usage", None)
             if usage:
-                self.total_tokens_used += usage.total_tokens
-                provider_usage = normalize_provider_usage(usage, model=self.model)
-                self.last_usage = provider_usage
+                provider_usage = usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -246,12 +280,15 @@ class AIClient:
                     if tc.function.arguments:
                         acc["arguments"] += tc.function.arguments
 
+        full_content = "".join(content_parts)
+        if provider_usage:
+            self._persist_usage(provider_usage, messages=messages, output_text=full_content)
         yield (
             "message",
             {
-                "content": "".join(content_parts),
+                "content": full_content,
                 "tool_calls": [tool_calls_acc[i] for i in sorted(tool_calls_acc)],
-                "usage": provider_usage.model_dump(mode="json") if provider_usage else None,
+                "usage": self.last_usage.model_dump(mode="json") if self.last_usage else None,
             },
         )
 

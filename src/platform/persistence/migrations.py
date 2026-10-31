@@ -8,10 +8,12 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+from src.platform.persistence.news_keys import has_similar_title, news_title_key
 
 logger = logging.getLogger(__name__)
 
@@ -2238,6 +2240,499 @@ def _m139_retire_session_legacy(conn: Connection) -> None:
                      {"id": identity, "config": json.dumps(config, ensure_ascii=False)})
 
 
+def _m140_market_news_and_digest(conn: Connection) -> None:
+    """事件驱动：市场新闻流 + AI 速览快照。"""
+    if not _has_table(conn, "market_news"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE market_news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest TEXT NOT NULL,
+    tags JSON,
+    relation_level INTEGER DEFAULT 0,
+    bullish_level INTEGER DEFAULT 0,
+    relations_stocks JSON,
+    news_time DATETIME NOT NULL,
+    news_type VARCHAR DEFAULT 'news',
+    news_md5 VARCHAR NOT NULL,
+    sources VARCHAR DEFAULT 'ths',
+    url VARCHAR DEFAULT '',
+    analyzed INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+        conn.execute(text("CREATE UNIQUE INDEX uq_market_news_md5 ON market_news(news_md5)"))
+        conn.execute(text("CREATE INDEX ix_market_news_time ON market_news(news_time)"))
+    if not _has_table(conn, "news_digest"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE news_digest (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at DATETIME NOT NULL,
+    window_start DATETIME NOT NULL,
+    window_end DATETIME NOT NULL,
+    news_count INTEGER DEFAULT 0,
+    title VARCHAR DEFAULT '',
+    headlines JSON,
+    highlights JSON,
+    model VARCHAR DEFAULT '',
+    trigger_type VARCHAR DEFAULT 'auto'
+)
+"""
+            )
+        )
+        conn.execute(text("CREATE INDEX ix_news_digest_generated_at ON news_digest(generated_at)"))
+
+
+def _m141_llm_token_usage(conn: Connection) -> None:
+    """LLM Token 使用量明细表（对齐 AlphaLom token 统计）。"""
+    if _has_table(conn, "llm_token_usage"):
+        return
+    conn.execute(
+        text(
+            """
+CREATE TABLE llm_token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    scene VARCHAR(64),
+    platform VARCHAR(64),
+    model VARCHAR(128) NOT NULL DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    input_text TEXT,
+    output_text TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    conn.execute(text("CREATE INDEX ix_llm_token_usage_created_at ON llm_token_usage(created_at)"))
+    conn.execute(text("CREATE INDEX ix_llm_token_usage_scene ON llm_token_usage(scene)"))
+    conn.execute(text("CREATE INDEX ix_llm_token_usage_model ON llm_token_usage(model)"))
+
+
+# 已知会写入中文的 JSON 列；SQLAlchemy 默认 ensure_ascii=True 会落成 \uXXXX，Navicat 看起来像乱码。
+_JSON_UNICODE_ESCAPE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("market_news", "tags"),
+    ("market_news", "relations_stocks"),
+    ("news_digest", "headlines"),
+    ("news_digest", "highlights"),
+    ("entry_candidates", "evidence"),
+    ("entry_candidates", "plan"),
+    ("entry_candidates", "meta"),
+    ("entry_candidates", "strategy_tags"),
+    ("strategy_signal_runs", "evidence"),
+    ("strategy_signal_runs", "payload"),
+    ("strategy_factor_snapshots", "factor_payload"),
+    ("stock_suggestions", "meta"),
+    ("stock_context_snapshots", "payload"),
+    ("stock_context_snapshots", "quality"),
+    ("data_sources", "config"),
+    ("data_sources", "test_symbols"),
+    ("agent_context_runs", "context_payload"),
+    ("assistant_task_runs", "context"),
+    ("assistant_task_runs", "result_data"),
+    ("assistant_task_events", "data"),
+    ("assistant_tool_invocations", "arguments"),
+    ("assistant_tool_invocations", "source_data"),
+    ("assistant_tool_invocations", "result_data"),
+    ("notification_events", "display_snapshot"),
+    ("notification_events", "template_params"),
+    ("notification_events", "actions"),
+)
+
+
+def _rewrite_json_unicode_escapes(conn: Connection, table: str, column: str) -> int:
+    if not _has_table(conn, table) or not _has_column(conn, table, column):
+        return 0
+    rows = conn.execute(text(f"SELECT rowid AS rid, {column} AS payload FROM {table}")).mappings().all()
+    changed = 0
+    for row in rows:
+        raw = row["payload"]
+        if not isinstance(raw, str) or "\\u" not in raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        rewritten = json.dumps(parsed, ensure_ascii=False)
+        if rewritten == raw:
+            continue
+        conn.execute(
+            text(f"UPDATE {table} SET {column} = :payload WHERE rowid = :rid"),
+            {"payload": rewritten, "rid": row["rid"]},
+        )
+        changed += 1
+    if changed:
+        logger.info("JSON 中文回写 %s.%s: %s 行", table, column, changed)
+    return changed
+
+
+def _m143_scheduler_job_runs(conn: Connection) -> None:
+    """系统调度任务执行历史表。"""
+    if not _has_table(conn, "scheduler_job_runs"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE scheduler_job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheduler_name TEXT NOT NULL DEFAULT '',
+    job_id TEXT NOT NULL DEFAULT '',
+    trigger_source TEXT DEFAULT 'schedule',
+    status TEXT NOT NULL DEFAULT 'success',
+    summary JSON,
+    error TEXT DEFAULT '',
+    duration_ms INTEGER DEFAULT 0,
+    started_at DATETIME,
+    finished_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_scheduler_job_runs_created",
+        "CREATE INDEX ix_scheduler_job_runs_created ON scheduler_job_runs(created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_scheduler_job_runs_scheduler_job",
+        "CREATE INDEX ix_scheduler_job_runs_scheduler_job ON scheduler_job_runs(scheduler_name, job_id, created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_scheduler_job_runs_status_created",
+        "CREATE INDEX ix_scheduler_job_runs_status_created ON scheduler_job_runs(status, created_at)",
+    )
+
+
+def _m144_scheduler_job_configs(conn: Connection) -> None:
+    """系统调度任务可编辑配置。"""
+    if not _has_table(conn, "scheduler_job_configs"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE scheduler_job_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheduler_name TEXT NOT NULL DEFAULT '',
+    job_id TEXT NOT NULL DEFAULT '',
+    schedule_expr TEXT NOT NULL DEFAULT '',
+    enabled BOOLEAN DEFAULT 1,
+    label TEXT DEFAULT '',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(scheduler_name, job_id)
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_scheduler_job_configs_scheduler",
+        "CREATE INDEX ix_scheduler_job_configs_scheduler ON scheduler_job_configs(scheduler_name)",
+    )
+
+
+def _m145_schema_table_comments(conn: Connection) -> None:
+    """SQLite 无表 COMMENT：建说明表 + 中文视图，并写入当前表用途。"""
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS schema_table_comments (
+    table_name VARCHAR PRIMARY KEY,
+    category VARCHAR NOT NULL DEFAULT '',
+    comment TEXT NOT NULL DEFAULT '',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    conn.execute(text('DROP VIEW IF EXISTS "表说明"'))
+    conn.execute(
+        text(
+            """
+CREATE VIEW "表说明" AS
+SELECT table_name AS 表名, category AS 分组, comment AS 说明
+FROM schema_table_comments
+ORDER BY category, table_name
+"""
+        )
+    )
+    from src.platform.persistence.table_comments import TABLE_COMMENTS
+
+    for table_name, category, comment in TABLE_COMMENTS:
+        conn.execute(
+            text(
+                """
+INSERT INTO schema_table_comments(table_name, category, comment)
+VALUES(:table_name, :category, :comment)
+ON CONFLICT(table_name) DO UPDATE SET
+    category = excluded.category,
+    comment = excluded.comment,
+    updated_at = CURRENT_TIMESTAMP
+"""
+            ),
+            {
+                "table_name": table_name,
+                "category": category,
+                "comment": comment,
+            },
+        )
+
+
+def _m146_drop_news_cache(conn: Connection) -> None:
+    """事件驱动已改用 market_news，删除不再写入的旧 news_cache。"""
+    if _has_table(conn, "news_cache"):
+        conn.execute(text("DROP TABLE news_cache"))
+    if _has_table(conn, "schema_table_comments"):
+        conn.execute(
+            text("DELETE FROM schema_table_comments WHERE table_name = 'news_cache'")
+        )
+
+
+def _m148_news_retry_and_digest_hash(conn: Connection) -> None:
+    """分析失败计数 + 速览输入指纹，避免反复打同一条 / 重复生成速览。"""
+    _add_column_if_missing(
+        conn,
+        "market_news",
+        "analyze_fail_count",
+        "ALTER TABLE market_news ADD COLUMN analyze_fail_count INTEGER DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "news_digest",
+        "input_hash",
+        "ALTER TABLE news_digest ADD COLUMN input_hash VARCHAR DEFAULT ''",
+    )
+
+
+def _m149_market_news_raw_text(conn: Connection) -> None:
+    """保留来源原文；分析只改写 digest。未分析的旧行 digest 仍是原文，顺手回填。"""
+    _add_column_if_missing(
+        conn,
+        "market_news",
+        "raw_text",
+        "ALTER TABLE market_news ADD COLUMN raw_text TEXT DEFAULT ''",
+    )
+    if _has_table(conn, "market_news"):
+        conn.execute(
+            text(
+                "UPDATE market_news SET raw_text = digest "
+                "WHERE analyzed = 0 AND (raw_text IS NULL OR raw_text = '')"
+            )
+        )
+
+
+def _m150_relabel_ths_reports(conn: Connection) -> None:
+    """旧规则把含「公告」的同花顺快讯也标成研报；只保留正文/原文含「研报」的。"""
+    if not _has_table(conn, "market_news"):
+        return
+    raw_text_clause = (
+        "AND COALESCE(raw_text, '') NOT LIKE '%研报%'"
+        if _has_column(conn, "market_news", "raw_text")
+        else ""
+    )
+    conn.execute(
+        text(
+            "UPDATE market_news SET news_type = 'news' "
+            "WHERE sources = 'ths' AND news_type = 'report' "
+            "AND COALESCE(digest, '') NOT LIKE '%研报%' "
+            f"{raw_text_clause}"
+        )
+    )
+
+
+def _m151_discard_neutral_news(conn: Connection) -> None:
+    """中性新闻（已分析且 bullish_level=0）改为直接删除，并留去重键防止重复入库。"""
+    if not _has_table(conn, "market_news_discards"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE market_news_discards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    news_md5 VARCHAR NOT NULL,
+    url VARCHAR DEFAULT '',
+    discarded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_market_news_discards_news_md5",
+        "CREATE UNIQUE INDEX ix_market_news_discards_news_md5 ON market_news_discards(news_md5)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_news_discards_url",
+        "CREATE INDEX ix_market_news_discards_url ON market_news_discards(url)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_news_discards_discarded_at",
+        "CREATE INDEX ix_market_news_discards_discarded_at ON market_news_discards(discarded_at)",
+    )
+    if not _has_table(conn, "market_news"):
+        return
+    neutral = "analyzed = 1 AND COALESCE(bullish_level, 0) = 0"
+    conn.execute(
+        text(
+            "INSERT OR IGNORE INTO market_news_discards(news_md5, url) "
+            f"SELECT news_md5, COALESCE(url, '') FROM market_news WHERE {neutral}"
+        )
+    )
+    conn.execute(text(f"DELETE FROM market_news WHERE {neutral}"))
+
+
+def _m152_discard_weak_signal_news(conn: Connection) -> None:
+    """利多利空 ±1 视同中性：已分析的一并删除并留去重键。"""
+    if not _has_table(conn, "market_news") or not _has_table(conn, "market_news_discards"):
+        return
+    weak = "analyzed = 1 AND ABS(COALESCE(bullish_level, 0)) < 2"
+    conn.execute(
+        text(
+            "INSERT OR IGNORE INTO market_news_discards(news_md5, url) "
+            f"SELECT news_md5, COALESCE(url, '') FROM market_news WHERE {weak}"
+        )
+    )
+    conn.execute(text(f"DELETE FROM market_news WHERE {weak}"))
+
+
+NEWS_DUPLICATE_WINDOW_HOURS = 12
+
+
+def _parse_sqlite_datetime(value) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _m153_news_title_dedupe(conn: Connection) -> None:
+    """跨来源标题去重：补标题键，并删掉 12 小时内同标题的后到副本（保留最早一条）。"""
+    _add_column_if_missing(
+        conn,
+        "market_news",
+        "title_key",
+        "ALTER TABLE market_news ADD COLUMN title_key VARCHAR DEFAULT ''",
+    )
+    _add_column_if_missing(
+        conn,
+        "market_news_discards",
+        "title_key",
+        "ALTER TABLE market_news_discards ADD COLUMN title_key VARCHAR DEFAULT ''",
+    )
+    _add_column_if_missing(
+        conn,
+        "market_news_discards",
+        "news_time",
+        "ALTER TABLE market_news_discards ADD COLUMN news_time DATETIME",
+    )
+    if _has_table(conn, "market_news"):
+        _create_index_if_missing(
+            conn,
+            "ix_market_news_title_key",
+            "CREATE INDEX ix_market_news_title_key ON market_news(title_key)",
+        )
+    if _has_table(conn, "market_news_discards"):
+        _create_index_if_missing(
+            conn,
+            "ix_market_news_discards_title_key",
+            "CREATE INDEX ix_market_news_discards_title_key ON market_news_discards(title_key)",
+        )
+    if not _has_table(conn, "market_news"):
+        return
+
+    raw_text_expr = "raw_text" if _has_column(conn, "market_news", "raw_text") else "''"
+    rows = conn.execute(
+        text(
+            f"SELECT id, COALESCE(NULLIF({raw_text_expr}, ''), digest), news_time "
+            "FROM market_news ORDER BY news_time, id"
+        )
+    ).fetchall()
+    window = timedelta(hours=NEWS_DUPLICATE_WINDOW_HOURS)
+    kept_times: dict[str, list[datetime]] = {}
+    duplicate_ids: list[int] = []
+    for row_id, source_text, raw_time in rows:
+        key = news_title_key(source_text)
+        conn.execute(
+            text("UPDATE market_news SET title_key = :key WHERE id = :id"),
+            {"key": key, "id": row_id},
+        )
+        moment = _parse_sqlite_datetime(raw_time)
+        if not key or moment is None:
+            continue
+        earlier = kept_times.setdefault(key, [])
+        if any(abs(moment - seen) <= window for seen in earlier):
+            duplicate_ids.append(int(row_id))
+        else:
+            earlier.append(moment)
+    for row_id in duplicate_ids:
+        conn.execute(text("DELETE FROM market_news WHERE id = :id"), {"id": row_id})
+    if duplicate_ids:
+        logger.info("跨来源同标题新闻去重：删除 %s 条后到副本", len(duplicate_ids))
+
+
+def _m154_news_similar_title_dedupe(conn: Connection) -> None:
+    """标题去重从「完全相同」放宽到「相似」：清掉 12 小时内相似标题的后到副本（保留最早一条）。"""
+    if not _has_table(conn, "market_news") or not _has_column(conn, "market_news", "title_key"):
+        return
+    rows = conn.execute(
+        text(
+            "SELECT id, title_key, news_time FROM market_news "
+            "WHERE COALESCE(title_key, '') <> '' ORDER BY news_time, id"
+        )
+    ).fetchall()
+    window = timedelta(hours=NEWS_DUPLICATE_WINDOW_HOURS)
+    kept: list[tuple[str, datetime]] = []
+    duplicate_ids: list[int] = []
+    for row_id, key, raw_time in rows:
+        moment = _parse_sqlite_datetime(raw_time)
+        if moment is None:
+            continue
+        nearby = [seen_key for seen_key, seen_time in kept if abs(moment - seen_time) <= window]
+        if has_similar_title(key, nearby):
+            duplicate_ids.append(int(row_id))
+        else:
+            kept.append((key, moment))
+    for row_id in duplicate_ids:
+        conn.execute(text("DELETE FROM market_news WHERE id = :id"), {"id": row_id})
+    if duplicate_ids:
+        logger.info("相似标题新闻去重：删除 %s 条后到副本", len(duplicate_ids))
+
+
+def _m147_market_news_reasons(conn: Connection) -> None:
+    """分析理由落库，供事件驱动页展开查看。"""
+    _add_column_if_missing(
+        conn,
+        "market_news",
+        "bullish_level_reason",
+        "ALTER TABLE market_news ADD COLUMN bullish_level_reason TEXT DEFAULT ''",
+    )
+    _add_column_if_missing(
+        conn,
+        "market_news",
+        "relation_reason",
+        "ALTER TABLE market_news ADD COLUMN relation_reason TEXT DEFAULT ''",
+    )
+
+
+def _m142_json_store_chinese(conn: Connection) -> None:
+    """把历史 JSON 中的 \\uXXXX 转义回写为可读中文（ensure_ascii=False）。"""
+    total = 0
+    for table, column in _JSON_UNICODE_ESCAPE_COLUMNS:
+        total += _rewrite_json_unicode_escapes(conn, table, column)
+    logger.info("JSON 中文回写完成，合计 %s 行", total)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -2278,6 +2773,21 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(137, "stock_asset_type", _m137_stock_asset_type),
     Migration(138, "investment_research_delivery", _m138_investment_research),
     Migration(139, "retire_session_legacy", _m139_retire_session_legacy),
+    Migration(140, "market_news_and_digest", _m140_market_news_and_digest),
+    Migration(141, "llm_token_usage", _m141_llm_token_usage),
+    Migration(142, "json_store_chinese", _m142_json_store_chinese),
+    Migration(143, "scheduler_job_runs", _m143_scheduler_job_runs),
+    Migration(144, "scheduler_job_configs", _m144_scheduler_job_configs),
+    Migration(145, "schema_table_comments", _m145_schema_table_comments),
+    Migration(146, "drop_news_cache", _m146_drop_news_cache),
+    Migration(147, "market_news_reasons", _m147_market_news_reasons),
+    Migration(148, "news_retry_and_digest_hash", _m148_news_retry_and_digest_hash),
+    Migration(149, "market_news_raw_text", _m149_market_news_raw_text),
+    Migration(150, "relabel_ths_reports", _m150_relabel_ths_reports),
+    Migration(151, "discard_neutral_news", _m151_discard_neutral_news),
+    Migration(152, "discard_weak_signal_news", _m152_discard_weak_signal_news),
+    Migration(153, "news_title_dedupe", _m153_news_title_dedupe),
+    Migration(154, "news_similar_title_dedupe", _m154_news_similar_title_dedupe),
 )
 
 

@@ -55,6 +55,15 @@ class DataSourceUpdate(BaseModel):
     test_symbols: list[str] | None = None
 
 
+class DataSourceOrderItem(BaseModel):
+    id: int
+    priority: int
+
+
+class DataSourceReorder(BaseModel):
+    items: list[DataSourceOrderItem]
+
+
 class DataSourceResponse(BaseModel):
     id: int
     name: str
@@ -146,6 +155,45 @@ def reset_datasources_to_seed(db: Session = Depends(get_db)):
     summary = reconcile_data_sources(db, reset_test_symbols=True)
     logger.info(f"数据源手动对账完成: {summary}")
     return summary
+
+
+@router.put("/priority")
+def reorder_datasources(data: DataSourceReorder, db: Session = Depends(get_db)):
+    """批量更新一组数据源的优先级（页面上的「上移/下移」）。
+
+    为什么要单独开一个批量接口，而不是前端连续发两个 PUT：
+
+    1. *原子性*。SQLite 同一时刻只有一个写者。前端 ``Promise.all`` 并发发两个
+       PUT 时，后到的连接会以只读方式打开库（Windows + WAL 下拿不到 shm 独占），
+       写操作直接抛 ``attempt to write a readonly database`` → 其中一个请求 500，
+       另一个已经提交。表现出来就是「页面提示调整失败，刷新却发现已经生效」。
+    2. *重复优先级*。交换两条记录的 priority 要求两者取值不同；一旦组内出现
+       相同 priority（例如都为 5），交换后数值不变，点上下移会毫无反应。
+       这里由前端提交整组的新顺序，服务端按提交顺序重新分配，杜绝该情况。
+
+    路由必须注册在 ``PUT /{source_id}`` 之前，否则 "priority" 会被当成 id 解析。
+    """
+    if not data.items:
+        return {"updated": 0}
+
+    wanted = {item.id: item.priority for item in data.items}
+    if len(wanted) != len(data.items):
+        raise api_error(400, "datasource_duplicate_id", "同一个数据源不能在一次排序里出现两次")
+
+    sources = db.query(DataSource).filter(DataSource.id.in_(list(wanted))).all()
+    missing = sorted(set(wanted) - {s.id for s in sources})
+    if missing:
+        raise api_error(404, "datasource_not_found", f"数据源不存在: {missing}")
+
+    changed = 0
+    for source in sources:
+        priority = wanted[source.id]
+        if source.priority != priority:
+            source.priority = priority
+            changed += 1
+    db.commit()
+    logger.info("数据源顺序更新: %s", wanted)
+    return {"updated": changed}
 
 
 @router.get("/{source_id}")

@@ -819,11 +819,49 @@ class StrategyOutcome(Base):
     base_price = Column(Float, nullable=True)
     outcome_price = Column(Float, nullable=True)
     outcome_return_pct = Column(Float, nullable=True)
+    # 同期基准收益与超额。``outcome_return_pct`` 单独看没有意义：大盘涨 3% 时
+    # 一条 +2% 的信号其实是跑输的。基准取 510300，见 strategy/benchmark.py。
+    benchmark_return_pct = Column(Float, nullable=True)
+    excess_return_pct = Column(Float, nullable=True)
     hit_target = Column(Boolean, nullable=True)
     hit_stop = Column(Boolean, nullable=True)
     outcome_status = Column(String, nullable=False, default="pending")
     meta = Column(JSON, default={})
     evaluated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class StrategyBenchmark(Base):
+    """同期基准收益：把"信号赚了多少"换算成"比基准多赚多少"。
+
+    按 (snapshot_date, market, horizon_days) 唯一。同一个信号日 + 同一持有期
+    只算一次，避免逐条信号重复拉基准 K 线。
+    """
+
+    __tablename__ = "strategy_benchmarks"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date",
+            "stock_market",
+            "horizon_days",
+            name="uq_strategy_benchmark_key",
+        ),
+        Index("ix_strategy_benchmark_market_date", "stock_market", "snapshot_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    horizon_days = Column(Integer, nullable=False, default=1)
+    benchmark_symbol = Column(String, nullable=False, default="")
+    benchmark_base_price = Column(Float, nullable=True)
+    benchmark_end_price = Column(Float, nullable=True)
+    benchmark_return_pct = Column(Float, nullable=True)
+    target_date = Column(String, default="")
+    # 参与该 (日期, 持有期) 统计的信号数，用来判断这个基准对照有多少有效样本
+    sample_size = Column(Integer, nullable=False, default=0)
+    meta = Column(JSON, default={})
+    computed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 

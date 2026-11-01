@@ -88,6 +88,7 @@ def calibrate_factor_weights(
         changed = 0
         skipped_no_samples = 0
         skipped_below_ic = 0
+        statuses: dict[str, int] = {}
         rows_changed: list[dict] = []
 
         for code in CALIBRATABLE_FACTORS:
@@ -102,24 +103,49 @@ def calibrate_factor_weights(
             ir = stats.get("ir")
             n = int(stats.get("sample_size", 0))
 
-            # 记录最近一次观测(供 API 展示),无论是否调整。
-            row.meta = {
+            # 记录「检查过」而不是「校准过」。这两个时间戳必须分开：
+            # 改造前不论样本量多少都写 last_calibrated_at，于是 factor_weights 里
+            # 15 行（3 市场 × 5 因子）last_sample_size 全是 0、last_ic 全是 null，
+            # 却都带着当天时间戳——运维/UI 看到的是"已标定"，实际一次都没真用
+            # 样本算过。现在只有真算出 target 时才写 last_calibrated_at。
+            meta = {
                 **(row.meta or {}),
                 "last_ic": ic, "last_ir": ir, "last_sample_size": n,
-                "last_calibrated_at": utc_now().isoformat(),
+                "last_checked_at": utc_now().isoformat(),
             }
 
-            if row.is_pinned or not row.auto_calibrate:
-                continue
-            if n < min_samples or ic is None:
+            target = None
+            if row.is_pinned:
+                status = "pinned"
+            elif not row.auto_calibrate:
+                status = "disabled"
+            elif n < min_samples or ic is None:
                 skipped_no_samples += 1
+                status = "insufficient_samples"
+                meta["last_skip_reason"] = (
+                    f"samples {n} < {min_samples}" if ic is not None else "ic_missing"
+                )
+            else:
+                target = compute_target(code, ic, ir, beta=beta)
+                if target is None:
+                    # |IC| 没过闸:没有预测力,保持原权重而不是提权。
+                    skipped_below_ic += 1
+                    status = "no_predictive_power"
+                    meta["last_skip_reason"] = "ic_below_floor"
+                else:
+                    # 到这里才算真校准过：有样本、过了 |IC| 闸、算出了目标权重。
+                    # 即使 EMA 后权重没变（< 0.01）也记 calibrated——那是
+                    # "算过了，结论是不用动"，与"没样本可算"是两件事。
+                    status = "calibrated"
+                    meta["last_calibrated_at"] = utc_now().isoformat()
+                    meta.pop("last_skip_reason", None)
+
+            meta["calibration_status"] = status
+            row.meta = meta
+            statuses[status] = int(statuses.get(status, 0)) + 1
+            if status != "calibrated":
                 continue
-            target = compute_target(code, ic, ir, beta=beta)
-            if target is None:
-                # |IC| 没过闸:没有预测力,保持原权重而不是提权。
-                skipped_below_ic += 1
-                row.meta = {**(row.meta or {}), "last_skip_reason": "ic_below_floor"}
-                continue
+
             new = round(blend(old, target, alpha=alpha, lo=lo, hi=hi), 4)
             if abs(new - old) < 0.01:
                 continue
@@ -142,7 +168,9 @@ def calibrate_factor_weights(
         return {"market": market, "checked": len(CALIBRATABLE_FACTORS),
                 "changed": changed, "rows": rows_changed,
                 "skipped_no_samples": skipped_no_samples,
-                "skipped_below_ic": skipped_below_ic}
+                "skipped_below_ic": skipped_below_ic,
+                "statuses": statuses,
+                "calibrated_factors": int(statuses.get("calibrated", 0))}
     except Exception as e:  # pragma: no cover - 防御性
         logger.warning(f"[因子标定] market={market} 失败: {e}")
         db.rollback()

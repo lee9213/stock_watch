@@ -2870,6 +2870,151 @@ def _m158_news_title_key_extend(conn: Connection) -> None:
         logger.info("标题键回填后去重：删除 %s 条后到副本", len(duplicate_ids))
 
 
+def _m159_strategy_benchmark(conn: Connection) -> None:
+    """给后验加基准对照：信号自己赚多少不算数，比同期基准多赚多少才算 alpha。
+
+    改造前 ``strategy_outcomes`` 只存信号自己的收益，没有任何对照物。42 条信号
+    平均 +2% 时无法判断这是选股能力还是大盘上涨——本次会话核查时 ``strategy_outcomes``
+    是 0 行，连"平均收益是多少"都还没有，更没有能力回答"值不值得买"。
+
+    这里建 ``strategy_benchmarks``，按 (snapshot_date, market, horizon) 存同期基准
+    收益，并给 outcome 加 ``benchmark_return_pct`` / ``excess_return_pct`` 两列，
+    汇总时不必再 join。
+
+    基准标的用 510300（沪深300ETF）而不是 000300 指数：实测东财/同花顺都取不到
+    000300 的日线（连接被断 / 404），510300 可稳定拉取，且它是实物 ETF、有真实
+    成交价，跟踪误差在千分级，用来判断"有没有跑赢大盘"足够。
+    """
+    if not _has_table(conn, "strategy_outcomes"):
+        return
+    _add_column_if_missing(
+        conn,
+        "strategy_outcomes",
+        "benchmark_return_pct",
+        "ALTER TABLE strategy_outcomes ADD COLUMN benchmark_return_pct FLOAT",
+    )
+    _add_column_if_missing(
+        conn,
+        "strategy_outcomes",
+        "excess_return_pct",
+        "ALTER TABLE strategy_outcomes ADD COLUMN excess_return_pct FLOAT",
+    )
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_benchmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date VARCHAR NOT NULL,
+    stock_market VARCHAR NOT NULL DEFAULT 'CN',
+    horizon_days INTEGER NOT NULL,
+    benchmark_symbol VARCHAR NOT NULL DEFAULT '',
+    benchmark_base_price FLOAT,
+    benchmark_end_price FLOAT,
+    benchmark_return_pct FLOAT,
+    target_date VARCHAR DEFAULT '',
+    sample_size INTEGER NOT NULL DEFAULT 0,
+    meta JSON,
+    computed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_strategy_benchmark_key
+        UNIQUE (snapshot_date, stock_market, horizon_days)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_benchmark_market_date",
+        "CREATE INDEX ix_strategy_benchmark_market_date "
+        "ON strategy_benchmarks(stock_market, snapshot_date)",
+    )
+
+
+def _m160_factor_calibration_honesty(conn: Connection) -> None:
+    """清掉 factor_weights 里"零样本却写着已标定"的假时间戳。
+
+    旧实现每轮标定都无条件写 ``last_calibrated_at``，于是 15 行
+    （CN/HK/US × 5 因子）在 ``last_sample_size = 0``、``last_ic = null`` 的情况下
+    全都带着当天时间戳。后果是：``strategy_outcomes`` 还是 0 行、IC 从来没算出来过，
+    而运维/UI 看到的是"已标定，权重 1.0 是校准结果"，而不是"权重 1.0 是出厂默认"。
+
+    这里把这类行改成 ``calibration_status = "never_calibrated"`` 并移除假时间戳，
+    真正用样本校准过的行（``last_sample_size > 0``）保持原样。
+    """
+    if not _has_table(conn, "factor_weights"):
+        return
+    rows = conn.execute(text("SELECT id, meta FROM factor_weights")).fetchall()
+    fixed = 0
+    for row_id, raw in rows:
+        if not raw:
+            continue
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("last_calibrated_at") is None:
+            continue
+        if meta.get("last_sample_size"):
+            continue  # 真有样本，保留真实标定记录
+        meta.pop("last_calibrated_at", None)
+        meta["calibration_status"] = "never_calibrated"
+        meta["last_skip_reason"] = "backfill:no_samples_recorded"
+        conn.execute(
+            text("UPDATE factor_weights SET meta = :meta WHERE id = :id"),
+            {"meta": json.dumps(meta, ensure_ascii=False), "id": int(row_id)},
+        )
+        fixed += 1
+    if fixed:
+        logger.info("清理零样本假标定时间戳：%s 行", fixed)
+
+
+def _m161_refresh_table_comments(conn: Connection) -> None:
+    """把新增表的用途补进 schema_table_comments。
+
+    m145 只覆盖当时的表；之后新增的 ORM 表不会自动进说明表，
+    ``test_table_comments_cover_all_mapped_tables`` 会拦住这种漂移。
+    这里按当前 TABLE_COMMENTS 全量 upsert（幂等），保证「表说明」视图不漏表。
+    """
+    if not _has_table(conn, "schema_table_comments"):
+        return
+    from src.platform.persistence.table_comments import TABLE_COMMENTS
+
+    for table_name, category, comment in TABLE_COMMENTS:
+        conn.execute(
+            text(
+                """
+INSERT INTO schema_table_comments(table_name, category, comment, updated_at)
+VALUES (:table_name, :category, :comment, CURRENT_TIMESTAMP)
+ON CONFLICT(table_name) DO UPDATE SET
+    category = excluded.category,
+    comment = excluded.comment,
+    updated_at = CURRENT_TIMESTAMP
+"""
+            ),
+            {"table_name": table_name, "category": category, "comment": comment},
+        )
+
+
+def _m162_drop_wallstreet_event_news(conn: Connection) -> None:
+    """下线「华尔街见闻」事件驱动源。
+
+    该源是热榜接口，实测中位延迟 133 分钟（其余源均在 15 分钟内），且偏全球宏观，
+    与 A 股事件驱动的目标不符，已从 ``NEWS_SOURCE_SPECS`` 与 seed 中移除。
+    老库里残留的 ``type='event_news' AND provider='wallstreet'`` 行必须一并删掉，
+    否则 ``load_news_sources`` 读到它只会得到「未实现」的空采集。
+    """
+    if not _has_table(conn, "data_sources"):
+        return
+    result = conn.execute(
+        text(
+            "DELETE FROM data_sources "
+            "WHERE type = 'event_news' AND provider = 'wallstreet'"
+        )
+    )
+    if result.rowcount:
+        logger.info("下线华尔街见闻事件驱动源：删除 %s 条配置", result.rowcount)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -2929,6 +3074,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(156, "point_in_time_frozen", _m156_point_in_time_frozen),
     Migration(157, "signal_actionable_flag", _m157_signal_actionable),
     Migration(158, "news_title_key_extend", _m158_news_title_key_extend),
+    Migration(159, "strategy_benchmark", _m159_strategy_benchmark),
+    Migration(160, "factor_calibration_honesty", _m160_factor_calibration_honesty),
+    Migration(161, "refresh_table_comments", _m161_refresh_table_comments),
+    Migration(162, "drop_wallstreet_event_news", _m162_drop_wallstreet_event_news),
 )
 
 

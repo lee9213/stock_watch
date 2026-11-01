@@ -20,6 +20,7 @@ from src.modules.strategy.strategy_engine import (
     list_portfolio_risk_snapshots,
     list_strategy_signals,
     list_strategy_weight_history,
+    get_strategy_validation,
     rebalance_strategy_weights,
     refresh_strategy_signals,
 )
@@ -405,6 +406,21 @@ def strategy_factor_ic(
 ):
     """各因子的 IC/IR 有效性评估(StrategyFactorSnapshot × StrategyOutcome)。"""
     return evaluate_factor_ic(days=days, horizon=horizon)
+
+
+@router.get("/strategy-validation")
+def strategy_validation(
+    days: int = Query(180, ge=7, le=730, description="回看快照天数"),
+    horizon: int = Query(5, ge=1, le=60, description="持有期(交易日)"),
+    min_samples: int = Query(30, ge=5, le=1000, description="给出结论所需的最少样本"),
+):
+    """机会功能的"有没有用"体检：超额收益 + rank 分档区分度 + 因子校准状态。
+
+    与 ``/strategy-stats`` 的区别是这里给的是**相对基准**的口径。只看绝对收益
+    无法区分"选股准"和"大盘涨"，因此本接口以 510300 为基准算超额，并在样本
+    不足时直接返回 ``insufficient_samples`` 而不是照常给出胜率。
+    """
+    return get_strategy_validation(days=days, horizon=horizon, min_samples=min_samples)
 
 
 @router.get("/strategy-weight-history")

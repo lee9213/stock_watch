@@ -51,6 +51,7 @@ from src.modules.strategy.strategy_catalog import (
     list_strategy_catalog,
 )
 from src.modules.strategy.factor_weights import get_factor_weights
+from src.modules.strategy.benchmark import compute_excess, load_benchmark_returns
 from src.platform.scheduling.timezone import app_now, to_iso_with_tz, utc_now
 from src.platform.marketdata.models import MarketCode
 from src.platform.persistence.database import SessionLocal
@@ -2159,6 +2160,7 @@ def evaluate_strategy_outcomes(
         "skipped_no_price": 0,
         "skipped_no_base_price": 0,
         "skipped_not_filled": 0,
+        "benchmarked": 0,
     }
     safe_horizons = sorted({max(1, int(h)) for h in horizons if int(h) > 0})
     if not safe_horizons:
@@ -2193,6 +2195,10 @@ def evaluate_strategy_outcomes(
         # 先扫一遍收集 (symbol, market) 与所需回溯天数，并发预取。
         # 评估循环里按需串行拉 K 线时，limit=800 的场景要跑几分钟。
         kline_requests: dict[tuple[str, str], int] = {}
+        # 同期基准收益的 (snapshot_date, horizon) 组合。这里按 safe_horizons 全集
+        # 收集而不是只收"本轮 pending 的"，因为基准按 (日期, 持有期) 唯一，
+        # 提前算好后续轮次直接命中缓存，不必再联网。
+        benchmark_keys: set[tuple[str, int]] = set()
         for s in signals:
             snap_day = _parse_day(s.snapshot_date)
             if snap_day is None:
@@ -2203,7 +2209,17 @@ def evaluate_strategy_outcomes(
             key = ((s.stock_symbol or "").strip(), (s.stock_market or "CN").strip().upper())
             lookback = max(120, (today - snap_day).days + 30)
             kline_requests[key] = max(kline_requests.get(key, 0), lookback)
+            market = (s.stock_market or "CN").strip().upper()
+            for h in safe_horizons:
+                benchmark_keys.add(((s.snapshot_date or "").strip(), int(h)))
         kline_cache = prefetch_evaluation_klines(kline_requests)
+        # 基准按市场分别取；当前机会链路只有 CN，但接口允许后续扩展。
+        benchmarks: dict[tuple[str, str, int], dict] = {}
+        for market in {m for _, m in kline_requests} or {"CN"}:
+            for (day_str, horizon), payload in load_benchmark_returns(
+                db, benchmark_keys, market=market
+            ).items():
+                benchmarks[(market, day_str, horizon)] = payload
         pending = 0  # 分批提交计数,缩短写事务窗口
 
         for s in signals:
@@ -2273,6 +2289,20 @@ def evaluate_strategy_outcomes(
                 hit_stop = True if status == "hit_stop" else (False if filled else None)
                 if status == "not_filled":
                     stats["skipped_not_filled"] = int(stats.get("skipped_not_filled", 0)) + 1
+                # 同期基准：没有它，outcome_return_pct 无法判断是选股还是大盘。
+                # 取不到基准时两个字段留 None，绝不用 0 兜底——记 0 会让
+                # 「超额」等于原始收益，等于凭空造出 alpha。
+                bench = benchmarks.get(
+                    (
+                        (s.stock_market or "CN").strip().upper(),
+                        (s.snapshot_date or "").strip(),
+                        horizon,
+                    )
+                )
+                bench_ret = bench["return_pct"] if bench else None
+                excess_ret = compute_excess(ret, bench_ret)
+                if bench_ret is not None:
+                    stats["benchmarked"] = int(stats.get("benchmarked", 0)) + 1
                 db.add(
                     StrategyOutcome(
                         signal_run_id=s.id,
@@ -2286,6 +2316,8 @@ def evaluate_strategy_outcomes(
                         base_price=base_price,
                         outcome_price=outcome_price,
                         outcome_return_pct=ret,
+                        benchmark_return_pct=bench_ret,
+                        excess_return_pct=excess_ret,
                         hit_target=hit_target,
                         hit_stop=hit_stop,
                         outcome_status=status,
@@ -2300,6 +2332,8 @@ def evaluate_strategy_outcomes(
                                 "frozen_phase": (frozen.get("phase") if frozen else ""),
                                 "path_aware": True,
                                 "filled": filled,
+                                "benchmark_symbol": (bench or {}).get("symbol", ""),
+                                "benchmark_caliber": "t1_open_to_horizon_close" if bench else "",
                                 "fill_day": outcome_day_str(outcome["fill_day"]),
                                 "first_hit": outcome["first_hit"] or "",
                                 "exit_day": target_day.strftime("%Y-%m-%d"),
@@ -2505,6 +2539,214 @@ def rebalance_strategy_weights(
         }
     finally:
         db.close()
+
+
+def _mean(values: list[float]) -> float | None:
+    return (sum(values) / len(values)) if values else None
+
+
+def _t_stat(values: list[float]) -> float | None:
+    """单样本 t 统计量（均值是否显著不为 0）。样本 < 2 或方差为 0 返回 None。"""
+    n = len(values)
+    if n < 2:
+        return None
+    avg = sum(values) / n
+    var = sum((v - avg) ** 2 for v in values) / (n - 1)
+    sd = sqrt(var)
+    if sd <= 0:
+        return None
+    return avg / (sd / sqrt(n))
+
+
+# rank_score 分档边界。上界取 101 是为了让 100 分落进最后一档。
+_RANK_BUCKETS: tuple[tuple[float, float, str], ...] = (
+    (0.0, 60.0, "0-60"),
+    (60.0, 70.0, "60-70"),
+    (70.0, 80.0, "70-80"),
+    (80.0, 90.0, "80-90"),
+    (90.0, 101.0, "90+"),
+)
+
+
+def get_strategy_validation(
+    *, days: int = 180, horizon: int = 5, min_samples: int = 30
+) -> dict:
+    """回答一个问题：这套打分到底有没有选股能力。
+
+    与 ``get_strategy_stats`` 的区别：那个报"胜率 / 平均收益"，这个报**相对同期
+    基准的超额**和**分档区分度**。只看绝对收益会把"大盘涨了"当成"选股准"：
+    大盘涨 3% 时一条 +2% 的信号其实是跑输的。
+
+    结论分四档，样本不足时明确说"没有证据"，不给数字装样子：
+    - ``insufficient_samples``：收益样本不够，任何结论都是噪音
+    - ``no_benchmark``：有收益但同期基准缺失，无法算超额
+    - ``has_edge`` / ``negative_edge``：超额显著为正/为负（|t| >= 2）
+    - ``no_evidence``：样本够但超额与 0 无法区分
+
+    分档表回答第二个问题：高 rank 的票是否真的比低 rank 的赚得多。
+    若各档收益无差异，说明排序分只是在排队，没有区分能力。
+    """
+    db = SessionLocal()
+    try:
+        since_day = (app_now().date() - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
+        rows = (
+            db.query(StrategyOutcome)
+            .filter(
+                StrategyOutcome.snapshot_date >= since_day,
+                StrategyOutcome.horizon_days == int(horizon),
+            )
+            .all()
+        )
+
+        filled: list[dict] = []
+        not_filled = 0
+        for row in rows:
+            status = (row.outcome_status or "").strip()
+            if status == "not_filled":
+                not_filled += 1
+                continue
+            if status not in ("evaluated", "hit_target", "hit_stop"):
+                continue
+            if row.outcome_return_pct is None:
+                continue
+            meta = row.meta if isinstance(row.meta, dict) else {}
+            filled.append(
+                {
+                    "snapshot_date": (row.snapshot_date or "").strip(),
+                    "symbol": (row.stock_symbol or "").strip(),
+                    "rank": _safe_float(meta.get("rank_score")),
+                    "ret": float(row.outcome_return_pct),
+                    "bench": row.benchmark_return_pct,
+                    "excess": row.excess_return_pct,
+                    "hit_target": row.hit_target,
+                    "hit_stop": row.hit_stop,
+                    "strategy_code": (row.strategy_code or "").strip(),
+                }
+            )
+
+        rets = [r["ret"] for r in filled]
+        excess = [float(r["excess"]) for r in filled if r["excess"] is not None]
+        benchs = [float(r["bench"]) for r in filled if r["bench"] is not None]
+        dates = sorted({r["snapshot_date"] for r in filled if r["snapshot_date"]})
+
+        # 分档统计。没有 rank 的行（早期快照）单独归入 unknown，不混进分档。
+        buckets: list[dict] = []
+        for lo, hi, label in _RANK_BUCKETS:
+            items = [r for r in filled if r["rank"] is not None and lo <= r["rank"] < hi]
+            if not items:
+                buckets.append(
+                    {"label": label, "count": 0, "avg_return_pct": None,
+                     "avg_excess_pct": None, "hit_target_rate": None, "hit_stop_rate": None}
+                )
+                continue
+            b_excess = [float(r["excess"]) for r in items if r["excess"] is not None]
+            decided = [r for r in items if r["hit_target"] is not None]
+            buckets.append(
+                {
+                    "label": label,
+                    "count": len(items),
+                    "avg_return_pct": round(_mean([r["ret"] for r in items]) or 0.0, 4),
+                    "avg_excess_pct": round(_mean(b_excess), 4) if b_excess else None,
+                    "hit_target_rate": round(
+                        sum(1 for r in decided if r["hit_target"]) / len(decided) * 100.0, 2
+                    ) if decided else None,
+                    "hit_stop_rate": round(
+                        sum(1 for r in decided if r["hit_stop"]) / len(decided) * 100.0, 2
+                    ) if decided else None,
+                }
+            )
+
+        # 区分度：最高有效档 - 最低有效档的超额差。分档样本太少时不做判断。
+        usable = [b for b in buckets if b["count"] >= 5 and b["avg_excess_pct"] is not None]
+        spread = None
+        if len(usable) >= 2:
+            spread = round(usable[-1]["avg_excess_pct"] - usable[0]["avg_excess_pct"], 4)
+
+        avg_excess = _mean(excess)
+        t_excess = _t_stat(excess)
+        if len(filled) < min_samples:
+            verdict = "insufficient_samples"
+        elif len(excess) < min_samples:
+            verdict = "no_benchmark"
+        elif t_excess is not None and t_excess >= 2.0 and (avg_excess or 0) > 0:
+            verdict = "has_edge"
+        elif t_excess is not None and t_excess <= -2.0:
+            verdict = "negative_edge"
+        else:
+            verdict = "no_evidence"
+
+        sample = {
+            "outcomes": len(rows),
+            "evaluated": len(filled),
+            "not_filled": not_filled,
+            "with_benchmark": len(excess),
+            "distinct_dates": len(dates),
+            "first_date": dates[0] if dates else "",
+            "last_date": dates[-1] if dates else "",
+            "horizon_days": int(horizon),
+            "min_samples_required": int(min_samples),
+            "sufficient": len(filled) >= int(min_samples) and len(excess) >= int(min_samples),
+        }
+        alpha = {
+            "avg_return_pct": round(_mean(rets), 4) if rets else None,
+            "avg_benchmark_pct": round(_mean(benchs), 4) if benchs else None,
+            "avg_excess_pct": round(avg_excess, 4) if avg_excess is not None else None,
+            "t_stat": round(t_excess, 3) if t_excess is not None else None,
+            "beat_benchmark_rate": round(
+                sum(1 for v in excess if v > 0) / len(excess) * 100.0, 2
+            ) if excess else None,
+            "caliber": "excess = 信号收益 - 基准收益(510300, T+1开盘→第N日收盘)",
+        }
+
+        return {
+            "verdict": verdict,
+            "sample": sample,
+            "alpha": alpha,
+            "discrimination": {"buckets": buckets, "spread_pct": spread},
+            "calibration": _validation_calibration_block(db),
+            "note": _verdict_note(verdict, sample),
+        }
+    except Exception as e:
+        logger.warning(f"策略验证口径统计失败: {e}")
+        return {"verdict": "error", "error": str(e), "sample": {}, "alpha": {}}
+    finally:
+        db.close()
+
+
+def _verdict_note(verdict: str, sample: dict) -> str:
+    if verdict == "insufficient_samples":
+        need = int(sample.get("min_samples_required") or 30)
+        have = int(sample.get("evaluated") or 0)
+        return f"已评估 {have} 条，低于 {need} 条门槛，任何胜率/超额都是噪音，不作为结论。"
+    if verdict == "no_benchmark":
+        return "有收益样本但同期基准缺失，无法区分选股能力与大盘涨跌。"
+    if verdict == "has_edge":
+        return "超额收益显著为正（|t|>=2）：当前打分有可观测的选股能力。"
+    if verdict == "negative_edge":
+        return "超额收益显著为负（|t|<=-2）：当前打分在跑输基准，权重需要重审。"
+    return "样本够但超额与 0 无法区分：现有证据不足以支持「打分有效」。"
+
+
+def _validation_calibration_block(db) -> dict:
+    """因子校准状态摘要：有多少因子真的用样本校准过。"""
+    try:
+        from src.modules.strategy.factor_weights import get_all_factor_weights
+
+        rows = [r for r in get_all_factor_weights(db=db) if r.get("in_opportunity_scope")]
+        statuses: dict[str, int] = {}
+        for r in rows:
+            statuses[r["calibration_status"]] = statuses.get(r["calibration_status"], 0) + 1
+        calibrated = int(statuses.get("calibrated", 0))
+        return {
+            "factors": rows,
+            "calibrated_count": calibrated,
+            "total": len(rows),
+            "statuses": statuses,
+            "status": "calibrated" if calibrated else "never_calibrated",
+        }
+    except Exception as e:  # pragma: no cover - 防御性
+        logger.warning(f"读取因子校准状态失败: {e}")
+        return {"factors": [], "calibrated_count": 0, "total": 0, "statuses": {}, "status": "unknown"}
 
 
 def get_strategy_stats(*, days: int = 45) -> dict:

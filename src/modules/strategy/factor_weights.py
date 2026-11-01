@@ -14,6 +14,7 @@ import logging
 from src.platform.scheduling.timezone import utc_now
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import FactorWeight, FactorWeightHistory
+from src.modules.strategy.opportunity_markets import OPPORTUNITY_MARKETS
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,9 @@ def get_factor_weights(market: str, *, db=None) -> dict[str, float]:
 
 def _serialize(row: FactorWeight) -> dict:
     meta = row.meta or {}
+    status = meta.get("calibration_status") or (
+        "never_calibrated" if meta.get("last_calibrated_at") is None else "calibrated"
+    )
     return {
         "factor_code": row.factor_code,
         "market": row.market,
@@ -68,7 +72,14 @@ def _serialize(row: FactorWeight) -> dict:
         "last_ic": meta.get("last_ic"),
         "last_ir": meta.get("last_ir"),
         "last_sample_size": meta.get("last_sample_size"),
+        # last_checked_at = 每次标定任务都刷新；last_calibrated_at 只在真的
+        # 用够样本算出目标权重时才写。零样本时前者有值、后者为 None，
+        # 这正是「检查过但没校准」应有的样子（旧版两者混用，导致每天都像刚校准过）。
+        "last_checked_at": meta.get("last_checked_at"),
         "last_calibrated_at": meta.get("last_calibrated_at"),
+        "calibration_status": status,
+        "calibration_note": meta.get("last_skip_reason", ""),
+        "in_opportunity_scope": row.market in OPPORTUNITY_MARKETS,
         "reason": row.reason or "",
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }

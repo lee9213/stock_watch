@@ -32,6 +32,7 @@ TABLE_COMMENTS: tuple[tuple[str, str, str], ...] = (
     ("strategy_signal_runs", "机会与策略", "策略信号快照。按日/股票/策略一行，含动作、分数、门禁原因，机会列表主表。"),
     ("strategy_factor_snapshots", "机会与策略", "单条策略信号的因子分解（动量、资金、新闻等分项），解释为什么得这个分。"),
     ("strategy_outcomes", "机会与策略", "策略信号后验结果，用来评估该策略历史有效性。"),
+    ("strategy_benchmarks", "机会与策略", "同期基准收益（510300）。按信号日 × 持有期一行，把信号收益换算成超额收益。"),
     ("factor_weights", "机会与策略", "因子当前权重。按因子 × 市场，可由 IC/IR 标定或手工覆盖。"),
     ("factor_weight_history", "机会与策略", "因子调权历史，审计用。"),
     ("market_regime_snapshots", "机会与策略", "市场状态快照（趋势/震荡等），用于按市场动态调权和解释。"),

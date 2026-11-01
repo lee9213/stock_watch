@@ -1561,6 +1561,16 @@ def _format_signal(
         # composite、breakdown 写股票级最高值，前端读哪个都可能错），以顶层读到的值为准。
         score_breakdown = {**score_breakdown, "absolute_score": round(absolute_score, 4)}
     percentile_score = _safe_float((score_breakdown or {}).get("percentile_score"))
+    if percentile_score is None:
+        # 与 absolute_score 同样的坑：这两个值只写在行内 payload，``include_payload=False``
+        # 时 score_breakdown 是从 factor_snapshot 重建的，里面没有它们，列表接口会永远
+        # 返回 null，前端只能拿 rank_score 猜。这里回读原始 payload 兜底。
+        raw_payload = row.payload if isinstance(row.payload, dict) else {}
+        percentile_score = _safe_float(raw_payload.get("percentile_score"))
+        if percentile_score is None:
+            inner = raw_payload.get("score_breakdown")
+            percentile_score = _safe_float(inner.get("percentile_score")) if isinstance(inner, dict) else None
+    actionable_flag = bool(getattr(row, "actionable", False))
     return {
         "id": row.id,
         "snapshot_date": row.snapshot_date,
@@ -1581,12 +1591,14 @@ def _format_signal(
         # 绝对合成分（可 >100，跨日可比）。展示用 rank_score，做阈值/跨日对比看 absolute_score。
         "absolute_score": round(absolute_score, 2) if absolute_score is not None else None,
         "percentile_score": round(percentile_score, 2) if percentile_score is not None else None,
-        "score_scope": "percentile",
+        # rank_score 只有可执行行才是"当日百分位"，其余行是封顶后的合成分。写死 "percentile"
+        # 会让 65 分的观察行看起来像"相对排名 65%"，前端也因此分不清该拿哪个分做展示。
+        "score_scope": "percentile" if actionable_flag else "absolute",
         "confidence": round(float(row.confidence or 0), 3) if row.confidence is not None else None,
         "status": row.status or "inactive",
         # 能不能现在下单。status 说"信号多强"，actionable 说"现在能不能买"，
         # 前端徽标与"可执行 N 只"计数都应读这个字段。
-        "actionable": bool(getattr(row, "actionable", False)),
+        "actionable": actionable_flag,
         "action": action,
         "action_label": action_label,
         "signal": row.signal or "",

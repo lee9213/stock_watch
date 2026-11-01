@@ -47,11 +47,26 @@ engine = create_engine(
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_conn, connection_record):
     cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    # 这里刻意不执行 ``PRAGMA journal_mode=WAL``：它是库级持久属性（写进 db 文件头），
+    # 只需在启动时设一次，见 _ensure_wal_mode()。
+    # 之前每次建连接都设一次，等于每个请求都要抢一次写锁；poolclass=NullPool 下每个
+    # 请求都是新连接，并发时后到的连接拿不到 WAL 共享内存的独占权，会退化成只读连接，
+    # 后续写入直接报 "attempt to write a readonly database"（前端表现为请求 500，
+    # 但另一条并发请求已经提交成功）。
     cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+def _ensure_wal_mode() -> None:
+    """确保库处于 WAL 模式。幂等：已经是 WAL 时不做任何写入。"""
+    with engine.connect() as conn:
+        current = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+        if str(current or "").lower() == "wal":
+            return
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+        logger.info("SQLite journal_mode 已切换为 WAL（原值: %s）", current)
 
 
 SessionLocal = sessionmaker(bind=engine)
@@ -90,6 +105,7 @@ def init_db():
 
 
 def _init_db_once() -> None:
+    _ensure_wal_mode()
     # Take the recovery snapshot before any schema or legacy data changes.
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0 and has_pending_migrations(engine):
         _backup_db_before_migration()

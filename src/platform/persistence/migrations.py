@@ -3015,6 +3015,34 @@ def _m162_drop_wallstreet_event_news(conn: Connection) -> None:
         logger.info("下线华尔街见闻事件驱动源：删除 %s 条配置", result.rowcount)
 
 
+def _m164_normalize_datasource_priority(conn: Connection) -> None:
+    """把每个分组内的 priority 归一化成 0/10/20…
+
+    「上移/下移」的实现一开始是交换相邻两条的 priority，这在组内出现相同值时
+    完全失效（交换两个 5 还是 5，顺序不变，用户点了没反应）。库里 kline、quote、
+    flash_news、event_news 都存在重复值。这里按页面实际显示顺序
+    （priority, id）重排为 0/10/20…，既消除重复又不改变用户看到的先后。
+    """
+    if not _has_table(conn, "data_sources"):
+        return
+    rows = conn.execute(
+        text("SELECT id, type FROM data_sources ORDER BY type, priority, id")
+    ).all()
+    if not rows:
+        return
+    position: dict[str, int] = {}
+    updates: list[tuple[int, int]] = []
+    for row in rows:
+        idx = position.get(row.type, 0)
+        position[row.type] = idx + 1
+        updates.append((idx * 10, row.id))
+    conn.execute(
+        text("UPDATE data_sources SET priority = :priority WHERE id = :id"),
+        [{"priority": p, "id": i} for p, i in updates],
+    )
+    logger.info("数据源优先级归一化：%s 条记录按组重排为 0/10/20…", len(updates))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -3078,6 +3106,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(160, "factor_calibration_honesty", _m160_factor_calibration_honesty),
     Migration(161, "refresh_table_comments", _m161_refresh_table_comments),
     Migration(162, "drop_wallstreet_event_news", _m162_drop_wallstreet_event_news),
+    Migration(164, "normalize_datasource_priority", _m164_normalize_datasource_priority),
 )
 
 

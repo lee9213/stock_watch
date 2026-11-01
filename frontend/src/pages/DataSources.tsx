@@ -235,17 +235,28 @@ export default function DataSourcesPage() {
     return acc
   }, {} as Record<string, DataSource[]>)
 
-  // 组内按当前顺序(API 已按 type,priority,id 排序)与相邻源交换优先级
+  // 组内上移/下移：把整组的新顺序一次性提交给服务端重排。
+  //
+  // 不能再用两个并发 PUT 交换 priority：
+  //  1) SQLite 同一时刻只有一个写者，并发写入时后到的连接会退化为只读连接，
+  //     报 "attempt to write a readonly database" —— 其中一个请求 500，
+  //     另一个已经提交，页面就出现「提示失败、刷新却发现生效了」。
+  //  2) 交换 priority 要求两条取值不同；同组出现相同值（例如都为 5）时交换等于
+  //     什么都没做，点上下移毫无反应。
   const moveSource = async (source: DataSource, dir: -1 | 1) => {
     const group = groupedSources[source.type] || []
     const idx = group.findIndex(s => s.id === source.id)
-    const swap = group[idx + dir]
-    if (!swap) return
+    const target = idx + dir
+    if (idx < 0 || target < 0 || target >= group.length) return
+    const next = group.filter(s => s.id !== source.id)
+    next.splice(target, 0, source)
     try {
-      await Promise.all([
-        fetchAPI(`/datasources/${source.id}`, { method: 'PUT', body: JSON.stringify({ priority: swap.priority }) }),
-        fetchAPI(`/datasources/${swap.id}`, { method: 'PUT', body: JSON.stringify({ priority: source.priority }) }),
-      ])
+      await fetchAPI('/datasources/priority', {
+        method: 'PUT',
+        body: JSON.stringify({
+          items: next.map((s, i) => ({ id: s.id, priority: i * 10 })),
+        }),
+      })
       load()
     } catch { toast(t('configuration:dataSources.messages.reorderFailed'), 'error') }
   }

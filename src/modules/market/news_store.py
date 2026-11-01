@@ -14,7 +14,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.platform.persistence.models import MarketNews, MarketNewsDiscard, NewsDigest
-from src.platform.persistence.news_keys import has_similar_title, news_title_key
+from src.platform.persistence.news_keys import (
+    TitleIndex,
+    has_similar_title,
+    news_title_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,28 +373,59 @@ def is_discarded(db: Session, digest_hash: str, url: str = "") -> bool:
 
 
 def is_title_duplicate(db: Session, key: str, news_time: datetime | None) -> bool:
-    """发布时间前后 12 小时内已有相似标题的新闻或丢弃记录。"""
+    """已有相似标题的新闻或丢弃记录（发布时间或入库时间落在 ±12h 窗口内）。
+
+    只看发布时间会漏判转载：同一事件被别家隔十几小时重发时，两条的 news_time
+    相差远超窗口，但它们其实是同一时刻被我们收进来的。所以窗口同时按
+    「入库时间」开一次，判定时也按「本次入库时刻」再比一次。
+    """
     moment = _aware(news_time)
     if not key or moment is None:
         return False
+    now = datetime.now(timezone.utc)
     window = timedelta(hours=TITLE_DUPLICATE_WINDOW_HOURS)
+    stale = moment < now - window
     start, end = moment - window, moment + window
+    ingested_window = (now - window, now + window)
+    time_clause = (
+        or_(
+            and_(MarketNews.news_time >= start, MarketNews.news_time <= end),
+            and_(
+                MarketNews.created_at >= ingested_window[0],
+                MarketNews.created_at <= ingested_window[1],
+            ),
+        )
+        if stale
+        else and_(MarketNews.news_time >= start, MarketNews.news_time <= end)
+    )
     kept = (
         db.query(MarketNews.title_key)
-        .filter(
-            MarketNews.title_key != "",
-            MarketNews.news_time >= start,
-            MarketNews.news_time <= end,
-        )
+        .filter(MarketNews.title_key != "", time_clause)
         .all()
+    )
+    dropped_clause = (
+        or_(
+            and_(
+                MarketNewsDiscard.news_time >= start,
+                MarketNewsDiscard.news_time <= end,
+            ),
+            and_(
+                MarketNewsDiscard.discarded_at >= ingested_window[0],
+                MarketNewsDiscard.discarded_at <= ingested_window[1],
+            ),
+        )
+        if stale
+        else and_(
+            MarketNewsDiscard.news_time >= start,
+            MarketNewsDiscard.news_time <= end,
+        )
     )
     dropped = (
         db.query(MarketNewsDiscard.title_key)
         .filter(
             MarketNewsDiscard.title_key != "",
             MarketNewsDiscard.news_time.isnot(None),
-            MarketNewsDiscard.news_time >= start,
-            MarketNewsDiscard.news_time <= end,
+            dropped_clause,
         )
         .all()
     )
@@ -425,6 +460,27 @@ def prune_discards(db: Session, keep_hours: int = DISCARD_KEEP_HOURS) -> int:
     return int(deleted or 0)
 
 
+def _news_row(*, item: dict, digest: str, digest_hash: str, url: str, news_time: datetime) -> MarketNews:
+    """构造待写入的新闻行；单条与批量入库共用，避免两边默认值漂移。"""
+    stocks = merge_stocks(item.get("relations_stocks"))
+    relation_level = item.get("relation_level")
+    return MarketNews(
+        digest=digest,
+        raw_text=digest,
+        title_key=news_title_key(digest),
+        tags=attach_topic_tags(digest, item.get("tags") or [], stocks),
+        relation_level=int(relation_level if relation_level is not None else (3 if stocks else 0)),
+        bullish_level=int(item.get("bullish_level") or 0),
+        relations_stocks=stocks,
+        news_time=news_time,
+        news_type=item.get("news_type") or "news",
+        news_md5=digest_hash,
+        sources=item.get("sources") or "ths",
+        url=url,
+        analyzed=int(item.get("analyzed") or 0),
+    )
+
+
 def insert_news(db: Session, item: dict) -> MarketNews | None:
     digest = (item.get("digest") or "").strip()
     if not digest:
@@ -441,21 +497,8 @@ def insert_news(db: Session, item: dict) -> MarketNews | None:
     title_key = news_title_key(digest)
     if is_title_duplicate(db, title_key, news_time):
         return None
-    stocks = merge_stocks(item.get("relations_stocks"))
-    row = MarketNews(
-        digest=digest,
-        raw_text=digest,
-        title_key=title_key,
-        tags=attach_topic_tags(digest, item.get("tags") or [], stocks),
-        relation_level=int(item.get("relation_level") if item.get("relation_level") is not None else (3 if stocks else 0)),
-        bullish_level=int(item.get("bullish_level") or 0),
-        relations_stocks=stocks,
-        news_time=news_time,
-        news_type=item.get("news_type") or "news",
-        news_md5=digest_hash,
-        sources=item.get("sources") or "ths",
-        url=url,
-        analyzed=int(item.get("analyzed") or 0),
+    row = _news_row(
+        item=item, digest=digest, digest_hash=digest_hash, url=url, news_time=news_time
     )
     db.add(row)
     try:
@@ -465,6 +508,227 @@ def insert_news(db: Session, item: dict) -> MarketNews | None:
     except IntegrityError:
         db.rollback()
         return None
+
+
+# 单条 SQL 的 IN 参数上限（SQLite 变量上限 999，留余量）。
+_SQL_CHUNK_SIZE = 400
+
+
+def _chunked(values: list[str], size: int = _SQL_CHUNK_SIZE) -> list[list[str]]:
+    return [values[start:start + size] for start in range(0, len(values), size)]
+
+
+def _unique(values) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
+
+
+class NewsDedupSnapshot:
+    """一次批量入库需要的去重状态，替代逐条 5 次查库。
+
+    标题键按「发布时间」和「入库时间」两个时间锚分别入桶：转载 / 旧文重发会让
+    两者相差十几小时，只按发布时间开窗时，同一事件换个来源再进来会落在窗口外。
+    """
+
+    __slots__ = ("_now", "_window", "md5s", "titles", "urls")
+
+    def __init__(
+        self,
+        *,
+        window_hours: int = TITLE_DUPLICATE_WINDOW_HOURS,
+        now: datetime | None = None,
+    ):
+        self.md5s: set[str] = set()
+        self.urls: set[str] = set()
+        self.titles = TitleIndex(window_hours)
+        self._now = _aware(now) or datetime.now(timezone.utc)
+        self._window = timedelta(hours=max(1, int(window_hours)))
+
+    def add(self, md5: str, url: str, title_key: str, moment: datetime | None) -> None:
+        if md5:
+            self.md5s.add(md5)
+        if url:
+            self.urls.add(url)
+        if title_key:
+            self.titles.add_anchors(title_key, moment, self._now)
+
+    def blocked(self, md5: str, url: str, title_key: str, moment: datetime | None) -> bool:
+        """与 insert_news 的判重口径一致：md5 / 链接 / ±12h 相似标题。
+
+        候选本身就是旧文（发布时间比现在早一个窗口以上）时，再按「入库时刻」
+        比一次：转载常常隔十几小时才被另一个来源收进来，两条的发布时间差远超
+        窗口，但它们其实是同一件事。
+        """
+        if md5 and md5 in self.md5s:
+            return True
+        if url and url in self.urls:
+            return True
+        if self.titles.has_similar(title_key, moment):
+            return True
+        return bool(
+            title_key
+            and moment is not None
+            and moment < self._now - self._window
+            and self.titles.has_similar(title_key, self._now)
+        )
+
+
+def load_news_dedup_snapshot(
+    db: Session,
+    *,
+    md5s: list[str],
+    urls: list[str],
+    start: datetime,
+    end: datetime,
+) -> NewsDedupSnapshot:
+    """一次性预取 md5 / 链接 / 时段内标题键（含已丢弃记录）。"""
+    snapshot = NewsDedupSnapshot()
+    for chunk in _chunked(_unique(md5s)):
+        for model in (MarketNews, MarketNewsDiscard):
+            rows = db.query(model.news_md5).filter(model.news_md5.in_(chunk)).all()
+            snapshot.md5s.update(str(row[0]) for row in rows if row[0])
+    for chunk in _chunked(_unique(urls)):
+        for model in (MarketNews, MarketNewsDiscard):
+            rows = db.query(model.url).filter(model.url.in_(chunk)).all()
+            snapshot.urls.update(str(row[0]) for row in rows if row[0])
+    now = datetime.now(timezone.utc)
+    window = timedelta(hours=TITLE_DUPLICATE_WINDOW_HOURS)
+    for model, ingested_col in (
+        (MarketNews, MarketNews.created_at),
+        (MarketNewsDiscard, MarketNewsDiscard.discarded_at),
+    ):
+        rows = (
+            db.query(model.title_key, model.news_time, ingested_col)
+            .filter(
+                model.title_key != "",
+                model.news_time.isnot(None),
+                or_(
+                    and_(model.news_time >= start, model.news_time <= end),
+                    and_(ingested_col >= now - window, ingested_col <= now + window),
+                ),
+            )
+            .all()
+        )
+        for key, moment, ingested_at in rows:
+            if not key:
+                continue
+            aware = _aware(moment)
+            if aware is None:
+                continue
+            snapshot.titles.add_anchors(str(key), aware, _aware(ingested_at) or now)
+    return snapshot
+
+
+def prepare_news_items(
+    items: list[dict],
+) -> list[tuple[dict, str, str, str, datetime]]:
+    """把原始条目整理成 (item, digest, md5, url, news_time)。
+
+    与 ``insert_news_batch`` 分开，是为了让一轮采集可以先把多个来源的条目
+    一起整理、只建一次判重快照（否则每个来源各建一次，SQL 白白多一倍）。
+    """
+    prepared: list[tuple[dict, str, str, str, datetime]] = []
+    for item in items:
+        digest = (item.get("digest") or "").strip()
+        if not digest:
+            continue
+        prepared.append(
+            (
+                item,
+                digest,
+                item.get("news_md5") or news_md5(digest),
+                (item.get("url") or "").strip(),
+                _aware(item.get("news_time")) or datetime.now(timezone.utc),
+            )
+        )
+    return prepared
+
+
+def build_dedup_snapshot(
+    db: Session, prepared_groups: list[list[tuple[dict, str, str, str, datetime]]]
+) -> NewsDedupSnapshot:
+    """按多组已整理条目建一份共用的判重快照。"""
+    prepared = [row for group in prepared_groups for row in group]
+    window = timedelta(hours=TITLE_DUPLICATE_WINDOW_HOURS)
+    moments = [row[4] for row in prepared]
+    return load_news_dedup_snapshot(
+        db,
+        md5s=[row[2] for row in prepared],
+        urls=[row[3] for row in prepared],
+        start=min(moments) - window,
+        end=max(moments) + window,
+    )
+
+
+def insert_prepared_news(
+    db: Session,
+    prepared: list[tuple[dict, str, str, str, datetime]],
+    snapshot: NewsDedupSnapshot,
+) -> tuple[list[tuple[int, datetime]], list[dict]]:
+    """用给定快照落库一组已整理条目；返回 (新入库, 被判重跳过)。"""
+    if not prepared:
+        return [], []
+    rows: list[MarketNews] = []
+    stamps: list[datetime] = []
+    skipped: list[dict] = []
+    for item, digest, digest_hash, url, news_time in prepared:
+        title_key = news_title_key(digest)
+        if snapshot.blocked(digest_hash, url, title_key, news_time):
+            skipped.append(item)
+            continue
+        rows.append(
+            _news_row(
+                item=item, digest=digest, digest_hash=digest_hash, url=url, news_time=news_time
+            )
+        )
+        stamps.append(news_time)
+        # 同批内重复：后到的直接判重，不必等 flush 撞唯一索引。
+        snapshot.add(digest_hash, url, title_key, news_time)
+    if not rows:
+        return [], skipped
+
+    db.add_all(rows)
+    try:
+        db.flush()
+        created = [(int(row.id), moment) for row, moment in zip(rows, stamps)]
+        db.commit()
+        return created, skipped
+    except IntegrityError:
+        # 并发写入撞唯一索引（另一进程刚插入同一条）：整批回滚后逐条重试。
+        db.rollback()
+        created: list[tuple[int, datetime]] = []
+        for item in [row[0] for row in prepared]:
+            row = insert_news(db, item)
+            if row is not None and row.id is not None:
+                created.append((int(row.id), _aware(row.news_time) or datetime.now(timezone.utc)))
+        return created, []
+
+
+def insert_news_batch(
+    db: Session,
+    items: list[dict],
+    *,
+    snapshot: NewsDedupSnapshot | None = None,
+) -> tuple[list[tuple[int, datetime]], list[dict]]:
+    """批量入库：一次预取去重状态、一次提交。
+
+    返回 ``(新入库的 (id, news_time) 列表, 被判重跳过的条目)``。
+    调用方按 news_time 排序，就能让最新的一条先进分析队列。
+
+    ``snapshot``：一轮采集抓了多个来源时，可由 ``build_dedup_snapshot``
+    统一建一份传进来复用，避免每个来源各扫一遍标题窗口。
+    """
+    prepared = prepare_news_items(items)
+    if not prepared:
+        return [], []
+    if snapshot is None:
+        snapshot = build_dedup_snapshot(db, [prepared])
+    return insert_prepared_news(db, prepared, snapshot)
 
 
 def search_news(
@@ -532,6 +796,22 @@ def list_news_in_window(
         .all()
     )
     return [to_view(row) for row in rows]
+
+
+def count_pending_analysis(db: Session) -> int:
+    """待分析条数（不含失败次数用尽的），用于监控面板显示积压。"""
+    return int(
+        db.query(func.count(MarketNews.id))
+        .filter(
+            MarketNews.analyzed == 0,
+            or_(
+                MarketNews.analyze_fail_count.is_(None),
+                MarketNews.analyze_fail_count < MAX_ANALYZE_FAILS,
+            ),
+        )
+        .scalar()
+        or 0
+    )
 
 
 def list_unanalyzed(

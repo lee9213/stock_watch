@@ -2,17 +2,47 @@
 
 from __future__ import annotations
 
-from src.platform.marketdata.outcome_prices import completed_outcome_bar
+from src.platform.marketdata.outcome_prices import forward_bars
+from src.modules.strategy.plan_outcome import evaluate_plan_path, outcome_day_str
 
 import logging
 from datetime import date, datetime, timedelta
 from math import sqrt, tanh
 
-from sqlalchemy import and_, case, func
+from sqlalchemy import and_, case, func, select
 
-from src.platform.marketdata.collectors.kline_collector import KlineCollector
 from src.modules.market.news_store import MIN_SIGNAL_STRENGTH
-from src.modules.strategy.entry_candidates import normalize_stock_name, refresh_entry_candidates
+from src.modules.strategy.entry_candidates import (
+    normalize_stock_name,
+    phase_allows_freeze,
+    market_phase,
+    prefetch_evaluation_klines,
+    refresh_entry_candidates,
+)
+from src.modules.strategy.scoring_config import (
+    ACTIONABLE_RANK_CEIL,
+    ACTIONABLE_RANK_FLOOR,
+    CAP_INACTIVE_SCORE,
+    CAP_NO_ENTRY_PLAN,
+    CAP_WATCH_HOLDING,
+    CAP_WATCH_UNHELD,
+    DIRECT_NEWS_COUNT_CAP as DIRECT_NEWS_COUNT_CAP_CFG,
+    EVENT_SCORE_CAP as EVENT_SCORE_CAP_CFG,
+    MAX_HIGH_RISK_RATIO_BY_MARKET as MAX_HIGH_RISK_RATIO_BY_MARKET_CFG,
+    MAX_SINGLE_STRATEGY_SHARE as MAX_SINGLE_STRATEGY_SHARE_CFG,
+    MAX_UNHELD_ACTIVE_BY_MARKET as MAX_UNHELD_ACTIVE_BY_MARKET_CFG,
+    MIN_EVENT_BIAS_FOR_SIGNAL as MIN_EVENT_BIAS_FOR_SIGNAL_THRESHOLD,
+    MIN_PLAN_QUALITY_FOR_ACTIVE as MIN_PLAN_QUALITY_FOR_ACTIVE_CFG,
+    NEWS_BEARISH_WEIGHT as NEWS_BEARISH_WEIGHT_CFG,
+    NEWS_CATALYST_CAP as NEWS_CATALYST_CAP_CFG,
+    NEWS_IMPACT_HALF_LIFE_HOURS as NEWS_IMPACT_HALF_LIFE_HOURS_CFG,
+    NEWS_IMPACT_SCALE as NEWS_IMPACT_SCALE_CFG,
+    NEWS_MISSING_CAP as NEWS_MISSING_CAP_CFG,
+    NEWS_MISSING_PENALTY as NEWS_MISSING_PENALTY_CFG,
+    NEWS_MISSING_REQUIRES_DATA as NEWS_MISSING_REQUIRES_DATA_CFG,
+    NEWS_NAME_ONLY_WEIGHT as NEWS_NAME_ONLY_WEIGHT_CFG,
+    POINT_IN_TIME_START,
+)
 from src.platform.persistence.json_safe import to_jsonable
 from src.modules.strategy.strategy_catalog import (
     ensure_strategy_catalog,
@@ -21,7 +51,7 @@ from src.modules.strategy.strategy_catalog import (
     list_strategy_catalog,
 )
 from src.modules.strategy.factor_weights import get_factor_weights
-from src.platform.scheduling.timezone import to_iso_with_tz, utc_now
+from src.platform.scheduling.timezone import app_now, to_iso_with_tz, utc_now
 from src.platform.marketdata.models import MarketCode
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import (
@@ -175,21 +205,13 @@ DIRECT_NEWS_RELATION_LEVEL = 5
 # 一条新闻挂靠超过该数量代码，视为板块/大盘综述，不计个股直接新闻（工行银行综述）
 GENERIC_NEWS_SYMBOL_CAP = 3
 # 信号层偏空下限：event_bias 低于此值的买入信号降为观望
-MIN_EVENT_BIAS_FOR_SIGNAL = 0.0
+MIN_EVENT_BIAS_FOR_SIGNAL = float(MIN_EVENT_BIAS_FOR_SIGNAL_THRESHOLD)
 
-MAX_UNHELD_ACTIVE_BY_MARKET = {
-    "CN": 30,
-    "HK": 20,
-    "US": 20,
-}
+MAX_UNHELD_ACTIVE_BY_MARKET = dict(MAX_UNHELD_ACTIVE_BY_MARKET_CFG)
 
-MAX_HIGH_RISK_RATIO_BY_MARKET = {
-    "CN": 0.35,
-    "HK": 0.32,
-    "US": 0.30,
-}
+MAX_HIGH_RISK_RATIO_BY_MARKET = dict(MAX_HIGH_RISK_RATIO_BY_MARKET_CFG)
 
-MAX_SINGLE_STRATEGY_SHARE = 0.42
+MAX_SINGLE_STRATEGY_SHARE = float(MAX_SINGLE_STRATEGY_SHARE_CFG)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -338,6 +360,17 @@ def _extract_candidate_turnover(row: EntryCandidate) -> float | None:
     source_meta = meta.get("source_meta") if isinstance(meta.get("source_meta"), dict) else {}
     source_quote = source_meta.get("quote") if isinstance(source_meta.get("quote"), dict) else {}
     return _safe_float(source_quote.get("turnover"))
+
+
+def _extract_candidate_kline_value(row: EntryCandidate, key: str) -> float | None:
+    meta = row.meta if isinstance(row.meta, dict) else {}
+    kline = meta.get("kline") if isinstance(meta.get("kline"), dict) else {}
+    value = _safe_float(kline.get(key))
+    if value is not None:
+        return value
+    source_meta = meta.get("source_meta") if isinstance(meta.get("source_meta"), dict) else {}
+    source_kline = source_meta.get("kline") if isinstance(source_meta.get("kline"), dict) else {}
+    return _safe_float(source_kline.get(key))
 
 
 def _classify_market_regime(
@@ -572,6 +605,16 @@ def _load_news_metrics(
         for sym, name in symbol_name_map.items()
         if name and len(name) >= 2
     ]
+    # 正文点名匹配：原来对每条新闻逐只候选做子串判断（5000 条 × N 只），
+    # 改成一次编译的长词优先正则 + finditer，复杂度从 O(N×M) 降到 O(文本长度)。
+    name_symbol_map: dict[str, str] = {}
+    for name, sym in sorted(name_symbol_pairs, key=lambda x: -len(x[0])):
+        name_symbol_map.setdefault(name, sym)
+    name_pattern = None
+    if name_symbol_map:
+        import re
+
+        name_pattern = re.compile("|".join(re.escape(n) for n in name_symbol_map))
     if not symbol_set:
         return {}
 
@@ -608,11 +651,15 @@ def _load_news_metrics(
                 linked.add(code)
         name_only = False
         digest = normalize_stock_name(n.digest)
-        if not linked and digest:
-            for name, sym in name_symbol_pairs:
-                if name and name in digest:
-                    linked.add(sym)
-                    name_only = True
+        if not linked and digest and name_pattern is not None:
+            hits = {
+                name_symbol_map[m.group(0)]
+                for m in name_pattern.finditer(digest)
+                if m.group(0) in name_symbol_map
+            }
+            if hits:
+                linked |= hits
+                name_only = True
         if not linked:
             continue
 
@@ -757,7 +804,9 @@ def _demote_signal(row: StrategySignalRun, *, reason: str) -> None:
     row.action = "watch"
     row.action_label = "观望"
     payload = row.payload if isinstance(row.payload, dict) else {}
-    demoted_cap = 69.0 if bool(row.is_holding_snapshot) else 65.0
+    demoted_cap = (
+        float(CAP_INACTIVE_SCORE) if bool(row.is_holding_snapshot) else float(CAP_WATCH_UNHELD)
+    )
     row.rank_score = min(float(row.rank_score or 0.0), demoted_cap)
     if row.confidence is not None:
         row.confidence = min(float(row.confidence or 0.0), demoted_cap / 100.0)
@@ -782,17 +831,18 @@ def _demote_signal(row: StrategySignalRun, *, reason: str) -> None:
 
 
 # 单股新闻热度/直接条数封顶，避免工行这类综述堆分（热度仅用于展示与分档）
-EVENT_SCORE_CAP = 6.0
-DIRECT_NEWS_COUNT_CAP = 2
+EVENT_SCORE_CAP = float(EVENT_SCORE_CAP_CFG)
+DIRECT_NEWS_COUNT_CAP = float(DIRECT_NEWS_COUNT_CAP_CFG)
 # 新闻催化：单条影响 = 利多利空强度 × 关联权重 × 点名系数 × 时效衰减，按股票累加后 tanh 平滑封顶。
 # 校准：1 条新鲜、强关联的 +2 / +5 / +8 新闻约 +1.1 / +2.5 / +3.4；两条 +5 约 +3.8；上限 4.5。
-NEWS_CATALYST_CAP = 4.5
-NEWS_IMPACT_SCALE = 0.8
-NEWS_IMPACT_HALF_LIFE_HOURS = 24.0
+# 具体数值统一在 scoring_config（PW_* 可覆盖），此处保留同名模块常量以便既有引用不变。
+NEWS_CATALYST_CAP = float(NEWS_CATALYST_CAP_CFG)
+NEWS_IMPACT_SCALE = float(NEWS_IMPACT_SCALE_CFG)
+NEWS_IMPACT_HALF_LIFE_HOURS = float(NEWS_IMPACT_HALF_LIFE_HOURS_CFG)
 # 利空比利多更要紧：同强度利空按 1.5 倍计。
-NEWS_BEARISH_WEIGHT = 1.5
+NEWS_BEARISH_WEIGHT = float(NEWS_BEARISH_WEIGHT_CFG)
 # 只在正文点名、未列入关联股票的新闻打五折。
-NEWS_NAME_ONLY_WEIGHT = 0.5
+NEWS_NAME_ONLY_WEIGHT = float(NEWS_NAME_ONLY_WEIGHT_CFG)
 
 
 def _news_relevance_weight(relation_level: int) -> float:
@@ -822,23 +872,45 @@ def _news_catalyst(news_impact: float) -> float:
     return NEWS_CATALYST_CAP * tanh(float(news_impact or 0.0) / NEWS_IMPACT_SCALE)
 
 
-ACTIONABLE_RANK_FLOOR = 75.0
-ACTIONABLE_RANK_CEIL = 100.0
+def _is_actionable(row: StrategySignalRun) -> bool:
+    """现在能不能下单：与"信号强不强"(status) 分开判断。
+
+    改造前用 ``rank_score >= 75`` 兼作可执行判据，但缺个股直接新闻的行会被扣分
+    封顶到 74——于是 active 行里混进"可执行 74 分"，"可执行 ⇒ ≥75" 的不变量被打破。
+    现在可执行只看结构性条件，rank_score 恢复成纯排序分。
+    """
+    if (row.status or "inactive") != "active":
+        return False
+    if (row.action or "watch") not in ("buy", "add"):
+        return False
+    if row.entry_low is None or row.entry_high is None:
+        return False
+    if int(getattr(row, "plan_quality", 0) or 0) < int(MIN_PLAN_QUALITY_FOR_ACTIVE_CFG):
+        return False
+    payload = getattr(row, "payload", None)
+    payload = payload if isinstance(payload, dict) else {}
+    if payload.get("news_gate") == "missing_direct_news":
+        return False
+    if bool(payload.get("preview")):
+        # 盘前预演只是名单，开盘后要重新判定，不算可执行。
+        return False
+    return True
 
 
 def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
-    """可执行信号（active + buy/add + 有区间 + 分数≥75）按同日同市场百分位重映射到 [75, 100]，
-    避免叠加分数集体封顶 100 后无法排序。按股票排名：同一只股票的各策略行取其最高 composite，
-    共享同一个分数，排序比的是股票而不是同股的策略权重。返回重映射条数。"""
+    """可执行信号按同日同市场百分位重映射到 75~100（开区间），避免叠加分数集体封顶 100 后无法排序。
+    按股票排名：同一只股票的各策略行取其最高 composite，共享同一个分数，
+    排序比的是股票而不是同股的策略权重。返回重映射条数。
+
+    百分位用中点口径 ``(idx + 0.5) / n``（等价于"偏离中位按 (n-1)/n 收缩"）：
+    旧口径 ``idx / (n - 1)`` 在 n=1 时除零，退回 ``pct = 1.0``，即"当日只有 1 只可执行票
+    ⇒ 它一定是 100 分"。实测当日可执行只有 600519（4 条策略行 → 1 只票），4 行全读 100，
+    最高分来自"没有对照"而不是"最强"。中点口径下 n=1 → 87.5（中位），
+    n 越大越贴近上下限，理论上界 100 - span/(2n)，不会再出现虚假登顶。
+    """
     by_market: dict[str, list[tuple[StrategySignalRun, float]]] = {}
     for r in rows:
-        if (r.status or "inactive") != "active":
-            continue
-        if (r.action or "watch") not in ("buy", "add"):
-            continue
-        if r.entry_low is None or r.entry_high is None:
-            continue
-        if float(r.rank_score or 0.0) < ACTIONABLE_RANK_FLOOR:
+        if not _is_actionable(r):
             continue
         payload = r.payload if isinstance(r.payload, dict) else {}
         breakdown = payload.get("score_breakdown") if isinstance(payload.get("score_breakdown"), dict) else {}
@@ -856,16 +928,31 @@ def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
             sym = (row.stock_symbol or "").strip()
             stock_best[sym] = max(stock_best.get(sym, composite), composite)
         levels = sorted(set(stock_best.values()))
-        denom = len(levels) - 1
-        for row, _ in items:
+        n = len(levels)
+        level_index = {value: idx for idx, value in enumerate(levels)}
+        for row, _composite in items:
             stock_score = stock_best[(row.stock_symbol or "").strip()]
-            pct = levels.index(stock_score) / denom if denom > 0 else 1.0
+            # 中点百分位 ∈ (0, 1)；n=1 时恰为 0.5，样本不足也不会被顶到上限。
+            pct = (level_index.get(stock_score, 0) + 0.5) / n
             score = round(ACTIONABLE_RANK_FLOOR + span * pct, 4)
+            # absolute_score 是未封顶的加权合成分，可以超过 100（实测 145.78）——
+            # 它衡量"绝对强度"，跨日可比；要 0-100 的展示分请用 percentile_score。
+            absolute = round(float(stock_score), 4)
             payload = dict(row.payload) if isinstance(row.payload, dict) else {}
             breakdown = dict(payload.get("score_breakdown") or {})
+            # 语义拆分：absolute_score 是未封顶的加权合成分（跨日可比，可 >100），
+            # percentile_score 是当日同市场百分位（只用于排序/展示 1-10 分）。
+            # weighted_score 保持旧语义（百分位后的分数），避免前端与既有快照读取错位。
+            breakdown["absolute_score"] = absolute
+            breakdown["percentile_score"] = score
             breakdown["weighted_score"] = score
             breakdown["rank_pct"] = round(pct * 100.0, 2)
             payload["score_breakdown"] = breakdown
+            # 同一只票的多条策略行共享股票级分数，payload 与 breakdown 必须一致——
+            # 之前 payload 写的是每行自己的 composite，接口按 breakdown 优先读，
+            # 两条路径给出不同分数（实测 136.05 vs 145.78）。
+            payload["absolute_score"] = absolute
+            payload["percentile_score"] = score
             row.payload = to_jsonable(payload)
             row.rank_score = score
             changed += 1
@@ -873,8 +960,21 @@ def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
 
 
 def _apply_direct_news_constraint(*, rows: list[StrategySignalRun]) -> dict:
-    """未持仓买入信号须有个股直接新闻，且新闻偏向不为利空，否则降为观望。"""
+    """新闻门槛：偏空硬降级；"没有直接新闻"改成降权 + 封顶的软约束。
+
+    硬降级的问题：当日没有新闻（或新闻服务覆盖不足）时，全市场买入信号会被整片
+    清空——"未知"被当成了"利空"。现在缺直接新闻只扣 NEWS_MISSING_PENALTY 并封顶到
+    NEWS_MISSING_CAP（低于可执行门槛 75）：页面仍能看到，但进不了可执行集合；
+    真正下单口（paper trading）另有 direct_news_count 硬门槛兜底。
+
+    进一步区分两种"没有直接新闻"：
+    - 该股一条新闻都没有（news_count=0）→ 数据覆盖缺失，只标记不封顶。
+      否则新闻服务只要没采到某只票，它就永远可执行不了；实测全市场 active 一律
+      封顶 74，可执行数恒为 0。
+    - 有相关新闻但都不直接 → 这才是"消息面没支撑"，按原逻辑封顶。
+    """
     missing = 0
+    missing_data = 0
     bearish = 0
     for row in rows:
         if (row.status or "inactive") != "active":
@@ -888,7 +988,39 @@ def _apply_direct_news_constraint(*, rows: list[StrategySignalRun]) -> dict:
             else {}
         )
         if int(news_metric.get("direct_news_count") or 0) < 1:
-            _demote_signal(row, reason="缺少个股直接新闻")
+            total_news = int(news_metric.get("news_count") or 0)
+            if NEWS_MISSING_REQUIRES_DATA_CFG and total_news < 1:
+                # 新闻侧完全没有这只票的数据：fail-open，只留痕。
+                payload = dict(payload)
+                payload["news_gate"] = "news_data_missing"
+                row.payload = to_jsonable(payload)
+                missing_data += 1
+                continue
+            penalty = float(NEWS_MISSING_PENALTY_CFG)
+            capped = round(
+                min(float(row.rank_score or 0.0) - penalty, float(NEWS_MISSING_CAP_CFG)),
+                4,
+            )
+            row.rank_score = capped
+            if row.confidence is not None:
+                row.confidence = min(float(row.confidence or 0.0), capped / 100.0)
+            payload = dict(payload)
+            breakdown = dict(payload.get("score_breakdown") or {})
+            breakdown["weighted_score"] = capped
+            breakdown["news_penalty"] = round(penalty, 4)
+            payload["score_breakdown"] = breakdown
+            payload["news_gate"] = "missing_direct_news"
+            payload["constrained"] = True
+            reasons = payload.get("constraint_reasons")
+            reasons = [str(x) for x in reasons if str(x).strip()] if isinstance(reasons, list) else []
+            if "缺少个股直接新闻(降权)" not in reasons:
+                reasons.append("缺少个股直接新闻(降权)")
+            payload["constraint_reasons"] = reasons[:6]
+            row.payload = to_jsonable(payload)
+            note = "缺少个股直接新闻，仅观察"
+            if note not in (row.reason or ""):
+                row.reason = f"{row.reason}；{note}" if row.reason else note
+            row.updated_at = utc_now()
             missing += 1
             continue
         event_bias = float(news_metric.get("event_bias") or 0.0)
@@ -897,10 +1029,16 @@ def _apply_direct_news_constraint(*, rows: list[StrategySignalRun]) -> dict:
             bearish += 1
     by_reason: dict[str, int] = {}
     if missing:
-        by_reason["missing_direct_news"] = missing
+        by_reason["missing_direct_news_penalized"] = missing
+    if missing_data:
+        by_reason["news_data_missing_fail_open"] = missing_data
     if bearish:
         by_reason["bearish_news"] = bearish
-    return {"demoted": missing + bearish, "by_reason": by_reason}
+    return {
+        "demoted": missing + bearish,
+        "by_reason": by_reason,
+        "news_data_missing": missing_data,
+    }
 
 
 def _apply_portfolio_constraints(*, rows: list[StrategySignalRun]) -> dict:
@@ -999,12 +1137,32 @@ def _compute_factor_breakdown(
     event_bias = float(_safe_float(nm.get("event_bias")) or 0.0)
     event_count = int(nm.get("news_count") or 0)
 
-    alpha_score = _clamp((base_score - 50.0) * 0.45, -12.0, 18.0)
+    # alpha = 独立量价信息。改造前是 (base_score-50)*0.45 的线性映射，与 base 完全共线：
+    # 所谓"因子拆解"里 alpha 与 base 是同一个量的两份拷贝，调 alpha 权重等价于调 base，
+    # factor_ic 测出来的也是同一个信号的重复测量。这里把 base 降为弱锚（0.18），
+    # 主体换成横截面相对强度 + 中期/短期动量 + 量价配合 + 均线偏离。
+    alpha_score = _clamp((base_score - 50.0) * 0.18, -5.0, 7.0)
+    change_5d = _extract_candidate_kline_value(row, "change_5d")
+    change_20d = _extract_candidate_kline_value(row, "change_20d")
+    ma20 = _extract_candidate_kline_value(row, "ma20")
     if relative_strength_pct is not None:
-        alpha_score += _clamp((relative_strength_pct - 50.0) / 15.0, -2.0, 4.0)
+        alpha_score += _clamp((relative_strength_pct - 50.0) / 10.0, -3.5, 3.5)
+    if change_20d is not None:
+        alpha_score += _clamp(change_20d / 12.0, -3.0, 3.0)
+    if change_5d is not None:
+        alpha_score += _clamp(change_5d / 8.0, -2.0, 2.0)
+    if volume_ratio is not None and quote_change_pct is not None:
+        if quote_change_pct > 0 and volume_ratio >= 1.2:
+            alpha_score += _clamp((volume_ratio - 1.0) * 1.2, 0.0, 2.5)
+        elif quote_change_pct < 0 and volume_ratio >= 1.5:
+            alpha_score -= 2.0
+    if ma20 is not None and ma20 > 0:
+        price_now = _safe_float(((row.meta or {}).get("quote") or {}).get("current_price")) if isinstance(row.meta, dict) else None
+        if price_now:
+            alpha_score += _clamp((price_now / ma20 - 1.0) * 15.0, -2.0, 2.0)
+    alpha_score = _clamp(alpha_score, -12.0, 18.0)
+
     catalyst_score = 0.0
-    if is_market_scan:
-        catalyst_score += 2.5
     if quote_change_pct is not None:
         if 1.0 <= quote_change_pct <= 7.0:
             catalyst_score += 4.0
@@ -1050,6 +1208,10 @@ def _compute_factor_breakdown(
     crowd_penalty += _clamp(crowding_risk, 0.0, 6.0)
 
     source_bonus = 0.0
+    # "来自市场扫描"只在来源项计一次。改造前 catalyst 里 +2.5、source_bonus 里再算一遍，
+    # 同一个属性被奖励两次，等于给全市场票无条件加固定分。
+    if is_market_scan:
+        source_bonus += 1.2
     if (row.source_agent or "") in ("premarket_outlook", "intraday_monitor"):
         source_bonus += 1.0
     if strategy_code in ("trend_follow", "volume_breakout", "macd_golden"):
@@ -1089,11 +1251,14 @@ def _compute_factor_breakdown(
     final_score = _clamp(composite_score, 0.0, 100.0)
     # Keep score semantics aligned with action/status: high scores should be actionable.
     if (row.status or "inactive") != "active":
-        final_score = min(final_score, 69.0)
+        final_score = min(final_score, float(CAP_INACTIVE_SCORE))
     if action in ("hold", "watch"):
-        final_score = min(final_score, 78.0 if is_holding else 65.0)
+        final_score = min(
+            final_score,
+            float(CAP_WATCH_HOLDING) if is_holding else float(CAP_WATCH_UNHELD),
+        )
     if action in ("buy", "add") and not has_entry:
-        final_score = min(final_score, 66.0)
+        final_score = min(final_score, float(CAP_NO_ENTRY_PLAN))
 
     return {
         "base_score": round(base_score, 4),
@@ -1103,6 +1268,11 @@ def _compute_factor_breakdown(
         "risk_penalty": round(risk_penalty, 4),
         "crowd_penalty": round(crowd_penalty, 4),
         "source_bonus": round(source_bonus, 4),
+        # absolute_score = 未做当日百分位归一前的绝对分（跨日可比），刻意不封顶：
+        # base_score 可到 100，再叠加 alpha/catalyst/source_bonus 和策略权重（0.95~1.18），
+        # 实测上限 145.78。它衡量的是绝对强度，封顶会让"强"和"极强"在顶部并成一片。
+        # 需要 0-100 的展示分时用 percentile_score / weighted_score，别拿这个字段当百分制。
+        "absolute_score": round(composite_score, 4),
         "regime": regime,
         "regime_label": _regime_label(regime),
         "regime_multiplier": round(regime_multiplier, 4),
@@ -1345,6 +1515,21 @@ def _format_signal(
         rank_score=float(row.rank_score or 0.0),
         has_entry_plan=has_entry_plan,
     )
+    absolute_score = _safe_float((score_breakdown or {}).get("absolute_score"))
+    if absolute_score is None:
+        # factor_snapshot 表里没有 absolute_score（它是归一化前的合成值，只存在行内 payload），
+        # include_payload=False 时上面的 score_breakdown 是重建出来的、不含该键。直接读原始
+        # payload 兜底，否则列表接口永远返回 null，前端拿不到跨日可比的分数。
+        raw_payload = row.payload if isinstance(row.payload, dict) else {}
+        absolute_score = _safe_float(raw_payload.get("absolute_score"))
+        if absolute_score is None:
+            inner = raw_payload.get("score_breakdown")
+            absolute_score = _safe_float(inner.get("absolute_score")) if isinstance(inner, dict) else None
+    if absolute_score is not None and isinstance(score_breakdown, dict) and "absolute_score" in score_breakdown:
+        # 顶层与 breakdown 不能给出两个数（旧版分别 136.05 / 145.78，来源是 payload 写每行
+        # composite、breakdown 写股票级最高值，前端读哪个都可能错），以顶层读到的值为准。
+        score_breakdown = {**score_breakdown, "absolute_score": round(absolute_score, 4)}
+    percentile_score = _safe_float((score_breakdown or {}).get("percentile_score"))
     return {
         "id": row.id,
         "snapshot_date": row.snapshot_date,
@@ -1361,8 +1546,16 @@ def _format_signal(
         "source_pool_label": _source_label(row.source_pool or "watchlist"),
         "score": round(float(row.score or 0), 2),
         "rank_score": round(float(rank_score or 0), 2),
+        # rank_score 是"当日同市场百分位分"（75~100，跨日不可比）；absolute_score 是未封顶的
+        # 绝对合成分（可 >100，跨日可比）。展示用 rank_score，做阈值/跨日对比看 absolute_score。
+        "absolute_score": round(absolute_score, 2) if absolute_score is not None else None,
+        "percentile_score": round(percentile_score, 2) if percentile_score is not None else None,
+        "score_scope": "percentile",
         "confidence": round(float(row.confidence or 0), 3) if row.confidence is not None else None,
         "status": row.status or "inactive",
+        # 能不能现在下单。status 说"信号多强"，actionable 说"现在能不能买"，
+        # 前端徽标与"可执行 N 只"计数都应读这个字段。
+        "actionable": bool(getattr(row, "actionable", False)),
         "action": action,
         "action_label": action_label,
         "signal": row.signal or "",
@@ -1564,6 +1757,8 @@ def refresh_strategy_signals(
                     "strategy_weight": weight,
                     "source_meta": compact_source_meta,
                     "score_breakdown": score_breakdown,
+                    # 盘前轮次产出的"预演"信号：可展示，但不应被模拟盘直接下单。
+                    "preview": bool(cmeta.get("preview")) if isinstance(cmeta, dict) else False,
                     "market_regime": {
                         "regime": regime_info.get("regime") or "neutral",
                         "regime_label": regime_info.get("regime_label") or _regime_label(regime_info.get("regime") or "neutral"),
@@ -1622,8 +1817,11 @@ def refresh_strategy_signals(
                 touched_keys.add(key)
                 touched_rows.append(row)
 
-        _normalize_actionable_rank(rows=touched_rows)
+        # 顺序很关键：新闻门槛必须先落 payload.news_gate，_is_actionable 才能据此
+        # 把"缺直接新闻"的行排除在可执行集合外；否则归一化会把它们拉回 75+，
+        # 扣分封顶和"可执行 ⇒ ≥75"两个约束互相打架。
         news_stats = _apply_direct_news_constraint(rows=touched_rows)
+        _normalize_actionable_rank(rows=touched_rows)
         constraint_stats = _apply_portfolio_constraints(rows=touched_rows)
         if news_stats.get("demoted", 0) > 0:
             logger.info(
@@ -1645,6 +1843,53 @@ def refresh_strategy_signals(
                 snapshot,
                 constraint_stats.get("demoted", 0),
                 constraint_stats.get("by_reason", {}),
+            )
+
+        # point-in-time 冻结：只认当日首个"盘中轮次"的可执行状态；盘前（昨天的数据）
+        # 和收盘后（已含当日结果）都不写。后验评估与调权只吃这一份，避免前视偏差。
+        phases = {m: market_phase(m) for m in (markets or ["CN"])}
+        frozen_count = 0
+        for row in touched_rows:
+            # 所有约束（新闻/组合）都跑完之后再定 actionable，避免"先标可执行、
+            # 后被组合约束降级"的行残留 True。
+            row.actionable = bool(_is_actionable(row))
+            if isinstance(row.frozen, dict) and row.frozen:
+                continue
+            market = (row.stock_market or "CN").strip().upper() or "CN"
+            if not phase_allows_freeze(phases.get(market, "unknown")):
+                continue
+            if not row.actionable:
+                continue
+            payload_raw = row.payload if isinstance(row.payload, dict) else {}
+            breakdown = (
+                payload_raw.get("score_breakdown")
+                if isinstance(payload_raw.get("score_breakdown"), dict)
+                else {}
+            )
+            row.frozen = to_jsonable(
+                {
+                    "status": row.status,
+                    "action": row.action,
+                    "action_label": row.action_label,
+                    "actionable": True,
+                    "rank_score": round(float(row.rank_score or 0.0), 4),
+                    "absolute_score": _safe_float(breakdown.get("absolute_score")),
+                    "risk_level": row.risk_level,
+                    "strategy_code": row.strategy_code,
+                    "entry_low": row.entry_low,
+                    "entry_high": row.entry_high,
+                    "stop_loss": row.stop_loss,
+                    "target_price": row.target_price,
+                    "plan_quality": int(row.plan_quality or 0),
+                    "phase": phases.get(market, "unknown"),
+                    "snapshot_date": snapshot,
+                    "frozen_at": to_iso_with_tz(utc_now()),
+                }
+            )
+            frozen_count += 1
+        if frozen_count:
+            logger.info(
+                "[策略层] point-in-time 冻结: snapshot=%s rows=%s", snapshot, frozen_count
             )
 
         # Remove stale strategy rows for same snapshot when strategy mapping changed.
@@ -1782,10 +2027,30 @@ def list_strategy_signals(
 
         q = q.filter(StrategySignalRun.rank_score >= float(min_score or 0))
         page_limit = max(1, int(limit))
-        fetch_limit = page_limit
         collapse = bool(dedupe_symbol) and not scode
         if collapse:
-            fetch_limit = min(2000, page_limit * 8)
+            # 折叠不能"先取 N*8 再在内存里去重"：热门票挂 5 个策略时 200 行能折成 40 条，
+            # 请求 limit=200 却只回 40 条。改在 SQL 里按股票取排名最高的一行，
+            # limit 作用在折叠之后，返回条数才与请求一致。
+            ranked = (
+                q.with_entities(
+                    StrategySignalRun.id.label("sid"),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            StrategySignalRun.stock_market,
+                            StrategySignalRun.stock_symbol,
+                        ),
+                        order_by=(
+                            StrategySignalRun.rank_score.desc(),
+                            StrategySignalRun.updated_at.desc(),
+                        ),
+                    )
+                    .label("rn"),
+                )
+                .subquery()
+            )
+            q = q.filter(StrategySignalRun.id.in_(select(ranked.c.sid).where(ranked.c.rn == 1)))
         rows = (
             q.order_by(
                 case(
@@ -1796,13 +2061,35 @@ def list_strategy_signals(
                 StrategySignalRun.rank_score.desc(),
                 StrategySignalRun.updated_at.desc(),
             )
-            .limit(fetch_limit)
+            .limit(page_limit)
             .all()
         )
         sibling_codes: dict[tuple[str, str], list[str]] = {}
-        if collapse:
-            rows, sibling_codes = _dedupe_signal_rows(rows)
-            rows = rows[:page_limit]
+        if collapse and rows:
+            # 折叠后只剩主行，其他策略代码需要单独补一次（同一快照 + 同一批股票）。
+            pair_markets = {((x.stock_market or "CN").strip().upper() or "CN") for x in rows}
+            pair_symbols = {(x.stock_symbol or "").strip() for x in rows}
+            extra = (
+                db.query(
+                    StrategySignalRun.stock_market,
+                    StrategySignalRun.stock_symbol,
+                    StrategySignalRun.strategy_code,
+                )
+                .filter(
+                    StrategySignalRun.snapshot_date == snapshot,
+                    StrategySignalRun.stock_market.in_(pair_markets),
+                    StrategySignalRun.stock_symbol.in_(pair_symbols),
+                )
+                .all()
+            )
+            for mkt, sym, code in extra:
+                key = ((mkt or "CN").strip().upper() or "CN", (sym or "").strip())
+                label = (code or "").strip()
+                if not label:
+                    continue
+                bucket = sibling_codes.setdefault(key, [])
+                if label not in bucket:
+                    bucket.append(label)
         factor_map: dict[int, StrategyFactorSnapshot] = {}
         if rows and not include_payload:
             ids = [int(x.id) for x in rows if x.id is not None]
@@ -1871,6 +2158,7 @@ def evaluate_strategy_outcomes(
         "skipped_not_due": 0,
         "skipped_no_price": 0,
         "skipped_no_base_price": 0,
+        "skipped_not_filled": 0,
     }
     safe_horizons = sorted({max(1, int(h)) for h in horizons if int(h) > 0})
     if not safe_horizons:
@@ -1878,7 +2166,7 @@ def evaluate_strategy_outcomes(
 
     db = SessionLocal()
     try:
-        cutoff = date.today() - timedelta(days=max(7, int(snapshot_days)))
+        cutoff = app_now().date() - timedelta(days=max(7, int(snapshot_days)))
         signals = (
             db.query(StrategySignalRun)
             .filter(
@@ -1901,14 +2189,50 @@ def evaluate_strategy_outcomes(
         )
         existing = {(int(x), int(y)) for x, y in existing_rows}
 
-        today = date.today()
-        kline_cache: dict[tuple[str, str], list] = {}
+        today = app_now().date()
+        # 先扫一遍收集 (symbol, market) 与所需回溯天数，并发预取。
+        # 评估循环里按需串行拉 K 线时，limit=800 的场景要跑几分钟。
+        kline_requests: dict[tuple[str, str], int] = {}
+        for s in signals:
+            snap_day = _parse_day(s.snapshot_date)
+            if snap_day is None:
+                continue
+            if not (isinstance(s.frozen, dict) and s.frozen):
+                if POINT_IN_TIME_START and (s.snapshot_date or "").strip() >= POINT_IN_TIME_START:
+                    continue
+            key = ((s.stock_symbol or "").strip(), (s.stock_market or "CN").strip().upper())
+            lookback = max(120, (today - snap_day).days + 30)
+            kline_requests[key] = max(kline_requests.get(key, 0), lookback)
+        kline_cache = prefetch_evaluation_klines(kline_requests)
         pending = 0  # 分批提交计数,缩短写事务窗口
 
         for s in signals:
             snap_day = _parse_day(s.snapshot_date)
             if snap_day is None:
                 continue
+            # point-in-time：优先用当日首个盘中轮次冻结下来的状态与计划，
+            # 避免"当天后续刷新（尤其收盘后）覆盖同一 snapshot_date"造成的前视。
+            frozen = s.frozen if isinstance(s.frozen, dict) else {}
+            if frozen:
+                eval_action = frozen.get("action") or s.action or ""
+                eval_rank = _safe_float(frozen.get("rank_score"))
+                eval_entry_low = _safe_float(frozen.get("entry_low"))
+                eval_entry_high = _safe_float(frozen.get("entry_high"))
+                eval_stop = _safe_float(frozen.get("stop_loss"))
+                eval_target = _safe_float(frozen.get("target_price"))
+                point_in_time = True
+            else:
+                # 没有 frozen 的当/近期快照 = 收盘后才被改判成 active 的行，
+                # 用当前值评估就是把当日收盘结果泄漏进决策，直接跳过。
+                if POINT_IN_TIME_START and (s.snapshot_date or "").strip() >= POINT_IN_TIME_START:
+                    continue
+                eval_action = s.action or ""
+                eval_rank = _safe_float(s.rank_score)
+                eval_entry_low = s.entry_low
+                eval_entry_high = s.entry_high
+                eval_stop = s.stop_loss
+                eval_target = s.target_price
+                point_in_time = False
             pending_horizons, skipped_not_due = _pending_due_horizons(
                 signal_id=int(s.id),
                 snapshot_day=snap_day,
@@ -1924,59 +2248,31 @@ def evaluate_strategy_outcomes(
                 (s.stock_symbol or "").strip(),
                 (s.stock_market or "CN").strip().upper(),
             )
-            if key not in kline_cache:
-                try:
-                    lookback = max(120, (today - snap_day).days + 30)
-                    kline_cache[key] = KlineCollector(_to_market(key[1])).get_klines(
-                        key[0], days=min(lookback, 600)
-                    )
-                except Exception:
-                    kline_cache[key] = []
-            klines = kline_cache[key]
+            klines = kline_cache.get(key, [])
 
             for horizon in pending_horizons:
-                bar = completed_outcome_bar(klines, snap_day, horizon, s.stock_market)
-                if bar is None:
+                bars = forward_bars(klines, snap_day, horizon, s.stock_market)
+                if bars is None:
                     stats["skipped_not_due"] += 1
                     continue
-                target_day, outcome_price = bar
                 stats["eligible"] += 1
-                base_price = None
-                if s.entry_low is not None and s.entry_high is not None:
-                    base_price = (float(s.entry_low) + float(s.entry_high)) / 2
-                elif s.entry_high is not None:
-                    base_price = float(s.entry_high)
-                elif s.entry_low is not None:
-                    base_price = float(s.entry_low)
-                if base_price is None:
-                    payload = s.payload if isinstance(s.payload, dict) else {}
-                    source_meta = payload.get("source_meta") if isinstance(payload.get("source_meta"), dict) else {}
-                    quote = source_meta.get("quote") if isinstance(source_meta.get("quote"), dict) else {}
-                    base_price = _safe_float(quote.get("current_price"))
-                if base_price is None:
-                    base_price = _pick_close_on_or_before(klines, snap_day)
-                if base_price is None or base_price <= 0:
-                    stats["skipped_no_base_price"] += 1
-                    status = "no_base_price"
-                    ret = None
-                else:
-                    ret = (outcome_price - base_price) / base_price * 100.0
-                    if s.target_price is not None and outcome_price >= float(s.target_price):
-                        status = "hit_target"
-                    elif s.stop_loss is not None and outcome_price <= float(s.stop_loss):
-                        status = "hit_stop"
-                    else:
-                        status = "evaluated"
-                hit_target = (
-                    bool(s.target_price is not None and outcome_price >= float(s.target_price))
-                    if status != "no_base_price"
-                    else None
+                outcome = evaluate_plan_path(
+                    bars,
+                    entry_low=eval_entry_low,
+                    entry_high=eval_entry_high,
+                    stop_loss=eval_stop,
+                    target_price=eval_target,
                 )
-                hit_stop = (
-                    bool(s.stop_loss is not None and outcome_price <= float(s.stop_loss))
-                    if status != "no_base_price"
-                    else None
-                )
+                target_day = outcome["outcome_day"] or bars[-1]["date"]
+                status = outcome["status"]
+                ret = outcome["return_pct"]
+                base_price = outcome["fill_price"]
+                outcome_price = outcome["outcome_price"]
+                filled = bool(outcome["filled"])
+                hit_target = True if status == "hit_target" else (False if filled else None)
+                hit_stop = True if status == "hit_stop" else (False if filled else None)
+                if status == "not_filled":
+                    stats["skipped_not_filled"] = int(stats.get("skipped_not_filled", 0)) + 1
                 db.add(
                     StrategyOutcome(
                         signal_run_id=s.id,
@@ -1996,9 +2292,17 @@ def evaluate_strategy_outcomes(
                         meta=to_jsonable(
                             {
                                 "horizon_unit": "trading_days",
-                            "rank_score": float(s.rank_score or 0),
-                                "action": s.action or "",
-                                "action_label": s.action_label or "",
+                                "rank_score": float(eval_rank or 0),
+                                "action": eval_action,
+                                "action_label": (frozen.get("action_label") if frozen else "") or s.action_label or "",
+                                "point_in_time": point_in_time,
+                                "frozen_at": (frozen.get("frozen_at") if frozen else ""),
+                                "frozen_phase": (frozen.get("phase") if frozen else ""),
+                                "path_aware": True,
+                                "filled": filled,
+                                "fill_day": outcome_day_str(outcome["fill_day"]),
+                                "first_hit": outcome["first_hit"] or "",
+                                "exit_day": target_day.strftime("%Y-%m-%d"),
                             }
                         ),
                         evaluated_at=utc_now(),
@@ -2024,7 +2328,9 @@ def evaluate_strategy_outcomes(
 
 
 def _aggregate_recent_outcomes(*, db, days: int):
-    since = utc_now() - timedelta(days=max(1, int(days)))
+    # 窗口用 snapshot_date（信号日期）而不是 created_at（入库日期）。补跑历史评估时
+    # created_at 全是今天，60 天前的信号会被整批挤进"最近 N 天"窗口去调策略权重。
+    since_day = (app_now().date() - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
     rows = (
         db.query(
             StrategyOutcome.strategy_code,
@@ -2034,7 +2340,7 @@ def _aggregate_recent_outcomes(*, db, days: int):
             func.avg(StrategyOutcome.outcome_return_pct).label("avg_ret"),
         )
         .filter(
-            StrategyOutcome.created_at >= since,
+            StrategyOutcome.snapshot_date >= since_day,
             StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
         )
         .group_by(StrategyOutcome.strategy_code, StrategyOutcome.stock_market)
@@ -2204,7 +2510,10 @@ def rebalance_strategy_weights(
 def get_strategy_stats(*, days: int = 45) -> dict:
     ensure_strategy_catalog()
     days = max(1, min(int(days or 45), 365))
-    since = utc_now() - timedelta(days=days)
+    # 后验统计按 snapshot_date（信号日期）切片，与调权窗口口径一致；
+    # 权重变更审计是事件记录，仍按 created_at。
+    since_day = (app_now().date() - timedelta(days=days)).strftime("%Y-%m-%d")
+    since_ts = utc_now() - timedelta(days=days)
     db = SessionLocal()
     try:
         latest_snapshot_row = (
@@ -2222,39 +2531,42 @@ def get_strategy_stats(*, days: int = 45) -> dict:
             "mixed_signals": 0,
         }
         if snapshot:
-            total_signals = (
-                db.query(func.count(StrategySignalRun.id))
+            # 统计口径统一到"票"：一只票会挂多条策略行（trend_follow / macd_golden …），
+            # 页面列表折叠到股票展示，若这里按行计数就会出现"可执行 120 只"但列表只有
+            # 40 条的对不上账。一次拉回当日行，在内存里按 (market, symbol) 去重聚合。
+            stat_rows = (
+                db.query(
+                    StrategySignalRun.stock_market,
+                    StrategySignalRun.stock_symbol,
+                    StrategySignalRun.actionable,
+                    StrategySignalRun.source_pool,
+                )
                 .filter(StrategySignalRun.snapshot_date == snapshot)
-                .scalar()
-            ) or 0
-            active_signals = (
-                db.query(func.count(StrategySignalRun.id))
-                .filter(
-                    StrategySignalRun.snapshot_date == snapshot,
-                    StrategySignalRun.status == "active",
+                .all()
+            )
+            stocks: dict[str, dict] = {}
+            for mkt, sym, actionable, pool in stat_rows:
+                key = f"{(mkt or 'CN').strip().upper()}:{(sym or '').strip()}"
+                slot = stocks.setdefault(
+                    key,
+                    {"actionable": False, "market_scan": False, "mixed": False},
                 )
-                .scalar()
-            ) or 0
-            market_scan = (
-                db.query(func.count(StrategySignalRun.id))
-                .filter(
-                    StrategySignalRun.snapshot_date == snapshot,
-                    StrategySignalRun.source_pool.in_(("market_scan", "mixed")),
-                )
-                .scalar()
-            ) or 0
-            mixed = (
-                db.query(func.count(StrategySignalRun.id))
-                .filter(
-                    StrategySignalRun.snapshot_date == snapshot,
-                    StrategySignalRun.source_pool == "mixed",
-                )
-                .scalar()
-            ) or 0
+                slot["actionable"] = slot["actionable"] or bool(actionable)
+                if (pool or "").strip() == "mixed":
+                    slot["mixed"] = True
+                    slot["market_scan"] = True
+                elif (pool or "").strip() == "market_scan":
+                    slot["market_scan"] = True
+            total_signals = len(stocks)
+            active_signals = sum(1 for s in stocks.values() if s["actionable"])
+            market_scan = sum(1 for s in stocks.values() if s["market_scan"])
+            mixed = sum(1 for s in stocks.values() if s["mixed"])
             watchlist = max(0, int(total_signals) - int(market_scan))
             coverage = {
                 "snapshot_date": snapshot,
+                "unit": "stocks",
                 "total_signals": int(total_signals),
+                # active_signals 现在是"可执行票数"（actionable），与页面列表口径一致。
                 "active_signals": int(active_signals),
                 "watchlist_signals": int(watchlist),
                 "market_scan_signals": int(market_scan),
@@ -2274,7 +2586,7 @@ def get_strategy_stats(*, days: int = 45) -> dict:
                 func.avg(StrategyOutcome.outcome_return_pct).label("avg_ret"),
             )
             .filter(
-                StrategyOutcome.created_at >= since,
+                StrategyOutcome.snapshot_date >= since_day,
                 StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
             )
             .group_by(
@@ -2332,7 +2644,7 @@ def get_strategy_stats(*, days: int = 45) -> dict:
                 func.avg(StrategyOutcome.outcome_return_pct).label("avg_ret"),
             )
             .filter(
-                StrategyOutcome.created_at >= since,
+                StrategyOutcome.snapshot_date >= since_day,
                 StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
             )
             .group_by(StrategyOutcome.stock_market)
@@ -2354,7 +2666,7 @@ def get_strategy_stats(*, days: int = 45) -> dict:
 
         updates = (
             db.query(func.count(StrategyWeightHistory.id))
-            .filter(StrategyWeightHistory.created_at >= since)
+            .filter(StrategyWeightHistory.created_at >= since_ts)
             .scalar()
         ) or 0
 

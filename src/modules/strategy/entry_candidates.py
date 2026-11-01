@@ -1,15 +1,47 @@
 from __future__ import annotations
 
-from src.platform.marketdata.outcome_prices import completed_outcome_bar
+from src.platform.marketdata.outcome_prices import forward_bars
+from src.modules.strategy.plan_outcome import evaluate_plan_path, outcome_day_str
 
 import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import String, and_, case, cast, func, or_
 
 from src.modules.automation.agent_catalog import RETIRED_AGENT_NAMES
+from src.modules.strategy.scoring_config import (
+    ACTION_BASE_SCORE,
+    ACTIVE_SCORE_MARKET_SCAN,
+    ACTIVE_SCORE_WATCHLIST,
+    CRASH_CHANGE_PCT,
+    FREEZE_PHASES,
+    INTRADAY_CONFIRM_CHANGE_PCT,
+    INTRADAY_CONFIRM_TAGS,
+    INTRADAY_CONFIRM_VOLUME_RATIO,
+    INTRADAY_PHASES,
+    KLINE_FETCH_WORKERS,
+    MIN_PLAN_QUALITY_FOR_ACTIVE,
+    MIN_TURNOVER_FOR_BUY,
+    OVERHEAT_DELTA_PCT,
+    PLAN_ATR_BAND_MULT,
+    PLAN_ATR_STOP_MULT,
+    PLAN_ATR_TARGET_MULT,
+    PLAN_BAND_HALF_MAX,
+    PLAN_BAND_HALF_MIN,
+    PLAN_BAND_WIDTH_MAX,
+    PLAN_BAND_WIDTH_MIN,
+    PLAN_MID_PRICE_RATIO_MAX,
+    PLAN_MIN_RISK_REWARD,
+    PLAN_STOP_MAX_PCT,
+    PLAN_STOP_MIN_PCT,
+    PLAN_TARGET_MAX_PCT,
+    POINT_IN_TIME_START,
+    STALE_QUOTE_MINUTES,
+)
 from src.platform.runtime.config import Settings
+from src.platform.scheduling import trading_calendar
+from src.platform.scheduling.timezone import app_now
 from src.platform.marketdata.collectors.discovery_collector import EastMoneyDiscoveryCollector
 from src.platform.marketdata.collectors.kline_collector import KlineCollector
 from src.platform.persistence.json_safe import to_jsonable
@@ -30,17 +62,6 @@ from src.platform.persistence.models import (
 
 logger = logging.getLogger(__name__)
 
-
-ACTION_BASE_SCORE: dict[str, float] = {
-    "buy": 78.0,
-    "add": 72.0,
-    "hold": 58.0,
-    "watch": 52.0,
-    "alert": 45.0,
-    "reduce": 30.0,
-    "sell": 20.0,
-    "avoid": 15.0,
-}
 
 AGENT_LABELS: dict[str, str] = {
     "premarket_outlook": "盘前分析",
@@ -228,15 +249,35 @@ def _normalize_kline_summary(data: dict | None) -> dict:
     if not raw:
         return {}
     out: dict[str, object] = {}
-    text_keys = ("trend", "macd_cross", "rsi_status", "kdj_status")
+    text_keys = ("trend", "macd_cross", "rsi_status", "kdj_status", "volume_trend")
     num_keys = (
         "volume_ratio",
         "support",
         "resistance",
+        "support_s",
         "support_m",
+        "support_l",
+        "resistance_s",
         "resistance_m",
+        "resistance_l",
         "last_close",
         "close",
+        # 计划构造需要波动率与结构位：旧白名单把这些全丢了，_build_plan 只能
+        # 用现价 ±1% 拍一个区间，导致止损/目标与 ATR 完全脱钩。
+        "atr",
+        "atr_pct",
+        "amplitude",
+        "amplitude_avg5",
+        "boll_upper",
+        "boll_mid",
+        "boll_lower",
+        "ma5",
+        "ma10",
+        "ma20",
+        "ma60",
+        "change_5d",
+        "change_20d",
+        "rsi6",
     )
     for key in text_keys:
         val = raw.get(key)
@@ -316,6 +357,9 @@ def _load_quote_fallbacks(
             continue
         quote = _extract_price_from_meta(row.meta or {})
         if _safe_float(quote.get("current_price")) is not None:
+            # 带上采集时间，供 quote_is_stale 判断这份补位行情还能不能用来开仓
+            if row.created_at is not None:
+                quote["quote_at"] = to_iso_with_tz(row.created_at)
             fallback[key] = quote
         if len(fallback) >= len(keys):
             break
@@ -331,7 +375,7 @@ def _load_kline_fallbacks(
     if not symbols:
         return {}
 
-    cutoff_day = (date.today() - timedelta(days=max(1, int(lookback_days)))).strftime("%Y-%m-%d")
+    cutoff_day = (app_now().date() - timedelta(days=max(1, int(lookback_days)))).strftime("%Y-%m-%d")
     cutoff_time = utc_now() - timedelta(days=max(1, int(lookback_days)))
     fallback: dict[str, dict] = {}
 
@@ -385,73 +429,140 @@ def _load_kline_fallbacks(
     return fallback
 
 
+# 候选层结构信号打分表（两个候选池共用）。
+#
+# 改造前自选/AI 池与热榜池各有一份公式：同一个"均线多头排列"在自选池值 +8、
+# 在热榜池值 +5；"当日涨幅适中"一个用 abs(pct)、一个只认上涨；热榜还多算成交额
+# 与策略标签。结果同一张机会列表里混着两种尺度的分数，只能靠不同的 active 门槛
+# （62 / 55）去补偿——门槛能补偿，**排序补偿不了**。
+#
+# 这里统一成一份权重表，两个池都用它。池间差异只保留在"AI 建议自身的质量/新鲜度"
+# 与 strategy_engine 的 source_bonus，那两项确实来源不同而非尺度不同。
+STRUCT_SCORE_WEIGHTS = {
+    "trend_bull": 6.5,
+    "trend_bear": -7.0,
+    "macd_golden": 4.5,
+    "macd_dead": -4.5,
+    "rsi_weak": 2.0,
+    "rsi_overbought": -3.0,
+    "kdj_golden": 2.5,
+    "kdj_dead": -2.5,
+    "volume_strong": 3.5,
+    "volume_mild": 2.0,
+    "momentum_healthy": 2.0,
+    "overheat": -8.0,
+    "wild_swing": -3.0,
+    "turnover_huge": 3.0,
+    "turnover_large": 1.0,
+    "tag_each": 2.0,
+    "tag_cap": 6.0,
+}
+
+
+def _score_structure_signals(
+    *,
+    quote: dict | None,
+    kline: dict | None,
+    symbol: str = "",
+    strategy_tags: list[str] | None = None,
+) -> tuple[float, list[str]]:
+    """趋势 / 动量 / 量能等结构信号的统一打分；两个候选池共用同一份权重。"""
+    w = STRUCT_SCORE_WEIGHTS
+    score = 0.0
+    evidence: list[str] = []
+    q = quote or {}
+    k = kline or {}
+
+    tags = [t for t in (strategy_tags or []) if t]
+    if tags:
+        score += min(float(w["tag_cap"]), len(tags) * float(w["tag_each"]))
+        evidence.append("策略信号: " + " / ".join(_strategy_labels(tags[:3])))
+
+    pct = _safe_float(q.get("change_pct"))
+    if pct is not None:
+        if pct >= float(overheat_change_pct(symbol)):
+            score += float(w["overheat"])
+            evidence.append(f"涨幅过热({pct:+.2f}%)")
+        elif 0.5 <= pct <= 6.0:
+            score += float(w["momentum_healthy"])
+            evidence.append(f"价格动量({pct:+.2f}%)")
+        elif pct <= CRASH_CHANGE_PCT:
+            score += float(w["wild_swing"])
+            evidence.append(f"当日大跌({pct:+.2f}%)")
+
+    turnover = _safe_float(q.get("turnover"))
+    if turnover is not None:
+        if turnover >= 3e9:
+            score += float(w["turnover_huge"])
+            evidence.append("成交额高")
+        elif turnover >= 1e9:
+            score += float(w["turnover_large"])
+
+    trend = (k.get("trend") or "").strip()
+    if trend == "多头排列":
+        score += float(w["trend_bull"])
+        evidence.append("均线多头排列")
+    elif trend == "空头排列":
+        score += float(w["trend_bear"])
+        evidence.append("均线空头排列")
+
+    macd = (k.get("macd_cross") or "").strip()
+    if macd == "金叉":
+        score += float(w["macd_golden"])
+        evidence.append("MACD 金叉")
+    elif macd == "死叉":
+        score += float(w["macd_dead"])
+        evidence.append("MACD 死叉")
+
+    rsi_status = (k.get("rsi_status") or "").strip()
+    if rsi_status in ("超卖", "偏弱"):
+        score += float(w["rsi_weak"])
+        evidence.append(f"RSI {rsi_status}")
+    elif rsi_status == "超买":
+        score += float(w["rsi_overbought"])
+        evidence.append(f"RSI {rsi_status}")
+
+    kdj_status = (k.get("kdj_status") or "").strip()
+    if "金叉" in kdj_status:
+        score += float(w["kdj_golden"])
+        evidence.append("KDJ 金叉")
+    elif "死叉" in kdj_status:
+        score += float(w["kdj_dead"])
+        evidence.append("KDJ 死叉")
+
+    vol_ratio = _safe_float(k.get("volume_ratio"))
+    if vol_ratio is not None:
+        if vol_ratio >= 2:
+            score += float(w["volume_strong"])
+            evidence.append(f"量比放大({vol_ratio:.1f}x)")
+        elif vol_ratio >= 1.3:
+            score += float(w["volume_mild"])
+            evidence.append(f"量比温和放大({vol_ratio:.1f}x)")
+
+    return score, evidence
+
+
 def _score_suggestion(
     *,
     action: str,
     suggestion: StockSuggestion,
     quote: dict | None,
     kline: dict | None,
+    strategy_tags: list[str] | None = None,
+    symbol: str = "",
 ) -> tuple[float, list[str]]:
     score = ACTION_BASE_SCORE.get((action or "").strip().lower(), 45.0)
-    evidence: list[str] = []
+    struct_score, evidence = _score_structure_signals(
+        quote=quote, kline=kline, symbol=symbol, strategy_tags=strategy_tags
+    )
+    score += struct_score
 
     if suggestion.signal:
         evidence.append(f"建议信号: {suggestion.signal}")
     if suggestion.reason:
         evidence.append(f"建议依据: {suggestion.reason}")
 
-    if quote:
-        pct = _safe_float(quote.get("change_pct"))
-        if pct is not None:
-            if 0.5 <= abs(pct) <= 6:
-                score += 2
-                evidence.append(f"当日波动适中({pct:+.2f}%)")
-            elif abs(pct) >= 10:
-                score -= 3
-                evidence.append(f"当日波动过大({pct:+.2f}%)")
-
-    if kline:
-        trend = (kline.get("trend") or "").strip()
-        if trend == "多头排列":
-            score += 8
-            evidence.append("均线多头排列")
-        elif trend == "空头排列":
-            score -= 8
-            evidence.append("均线空头排列")
-
-        macd = (kline.get("macd_cross") or "").strip()
-        if macd == "金叉":
-            score += 5
-            evidence.append("MACD 金叉")
-        elif macd == "死叉":
-            score -= 5
-            evidence.append("MACD 死叉")
-
-        rsi_status = (kline.get("rsi_status") or "").strip()
-        if rsi_status in ("超卖", "偏弱"):
-            score += 2
-            evidence.append(f"RSI {rsi_status}")
-        elif rsi_status in ("超买",):
-            score -= 3
-            evidence.append(f"RSI {rsi_status}")
-
-        kdj_status = (kline.get("kdj_status") or "").strip()
-        if "金叉" in kdj_status:
-            score += 3
-            evidence.append("KDJ 金叉")
-        elif "死叉" in kdj_status:
-            score -= 3
-            evidence.append("KDJ 死叉")
-
-        vol_ratio = _safe_float(kline.get("volume_ratio"))
-        if vol_ratio is not None:
-            if vol_ratio >= 2:
-                score += 4
-                evidence.append(f"量比放大({vol_ratio:.1f}x)")
-            elif vol_ratio >= 1.3:
-                score += 2
-                evidence.append(f"量比温和放大({vol_ratio:.1f}x)")
-
+    # 以下两项是 AI 建议独有的信号，热榜票没有对应信息，不属于"尺度不一致"。
     q = suggestion.meta or {}
     quality = _safe_float((q.get("context_quality_score") if isinstance(q, dict) else None))
     if quality is not None:
@@ -504,6 +615,8 @@ def _build_plan(
     )
     support = _safe_float((kline or {}).get("support_m")) or _safe_float((kline or {}).get("support"))
     resistance = _safe_float((kline or {}).get("resistance_m")) or _safe_float((kline or {}).get("resistance"))
+    support_s = _safe_float((kline or {}).get("support_s"))
+    resistance_s = _safe_float((kline or {}).get("resistance_s"))
     trend = (kline or {}).get("trend") or ""
 
     entry_low = None
@@ -511,22 +624,99 @@ def _build_plan(
     stop_loss = None
     target_price = None
     invalidation = ""
+    atr_pct = None
+    plan_rr_ok = False
 
-    if price is not None:
+    if price is not None and price > 0:
+        atr = _safe_float((kline or {}).get("atr"))
+        atr_pct = _safe_float((kline or {}).get("atr_pct"))
+        if atr is not None and atr > 0:
+            atr_pct = atr / price
+        elif atr_pct is None or atr_pct <= 0:
+            # 没有 ATR 时退化为振幅，再退化为 2% 的固定波动假设
+            amplitude = _safe_float((kline or {}).get("amplitude"))
+            atr_pct = (amplitude / 100.0) if amplitude else 0.02
+        atr_pct = _clamp(float(atr_pct), 0.004, 0.12)
+        atr_value = atr if (atr is not None and atr > 0) else price * atr_pct
+
         if support is None:
-            support = price * 0.95
+            support = price * (1.0 - max(0.03, atr_pct * 1.5))
         if resistance is None:
-            resistance = price * 1.06
+            resistance = price * (1.0 + max(0.04, atr_pct * 2.0))
 
         if action in ("buy", "add"):
-            entry_low = price * 0.99
-            entry_high = price * 1.01
-            stop_loss = (support * 0.985) if support else (price * 0.95)
-            if resistance and resistance > price:
-                target_price = resistance * 0.99
+            # 区间宽度跟随波动率：原来的固定 ±1% 对高波动票太窄（开盘就被扫过），
+            # 对低波动票又太宽（永远等不到回踩）。半宽 = ATR% × 系数，再夹住上下限。
+            half = _clamp(atr_pct * float(PLAN_ATR_BAND_MULT), float(PLAN_BAND_HALF_MIN), float(PLAN_BAND_HALF_MAX))
+            entry_low = price * (1.0 - half)
+            entry_high = price * (1.0 + half)
+            # 短线支撑若就在现价脚下（1.5×ATR 之内），把区间下沿抬到支撑上方：
+            # 回踩确认的买点应该在支撑附近，而不是一根均匀的对称带。
+            anchor = support_s if (support_s is not None and support_s < price) else support
+            if anchor is not None and 0 < (price - anchor) / price <= atr_pct * 1.5:
+                entry_low = min(price * (1.0 + half), max(anchor * 1.003, price * (1.0 - half)))
+
+            mid = (entry_low + entry_high) / 2.0
+            # 风险基准统一用区间上沿（最差成交价）。回踩买入时"高开回落"最先在
+            # entry_high 成交，用中点当成本会系统性低估风险：实测同一计划按 mid 算
+            # R:R=1.50 达标、按 entry_high 算只有 1.19。
+            fill_ref = entry_high
+
+            # 止损：支撑外扩与 ATR 止损取更靠外（更低）的一个，让结构位与波动率都不被击穿。
+            stop_by_atr = fill_ref - float(PLAN_ATR_STOP_MULT) * atr_value
+            stop_by_support = support * 0.99 if support else None
+            stop_struct = min(x for x in (stop_by_atr, stop_by_support, fill_ref) if x is not None)
+            stop_far = fill_ref * (1.0 - float(PLAN_STOP_MAX_PCT))  # 允许的最远止损
+            stop_near = fill_ref * (1.0 - float(PLAN_STOP_MIN_PCT))  # 允许的最近止损
+            stop_struct = _clamp(float(stop_struct), stop_far, stop_near)
+
+            # 目标由市场结构决定（阻力位 / ATR 目标），不再为了凑 R:R 往上抬。
+            # 改造前 target = max(结构目标, mid + 1.5×risk)，等于"先定风险再倒推目标"，
+            # 实测产出 目标 +12% / 止损 -8% / R:R 恰好 1.50 的计划——三个数字全是常量
+            # 边界，目标成了公式产物，与上方真实阻力无关（曾把目标抬到阻力之上 6.4%）。
+            anchor_res = (
+                resistance_s
+                if (resistance_s is not None and resistance_s > fill_ref)
+                else resistance
+            )
+            target_struct = price + float(PLAN_ATR_TARGET_MULT) * atr_value
+            if anchor_res is not None and anchor_res > fill_ref:
+                target_struct = max(target_struct, anchor_res * 0.99)
+            target_price = min(
+                float(target_struct), price * (1.0 + float(PLAN_TARGET_MAX_PCT))
+            )
+
+            # 目标定下来之后反推"止损最多能放多远"；结构止损太远就收紧到刚好达标，
+            # 收不动（要近过 PLAN_STOP_MIN_PCT）说明上方空间不足，本就不该买 → 降级。
+            #
+            # 反推时留 0.2% 余量：止损与目标随后都要 round 到 4 位小数，恰好卡在门槛上
+            # 会算出 1.4998 这种值，_plan_quality 只能靠容差放过，边界样本随机成败。
+            plan_rr_ok = False
+            rr_target = float(PLAN_MIN_RISK_REWARD) * 1.002
+            budget = (float(target_price) - fill_ref) / rr_target
+            if budget > 0:
+                stop_for_rr = fill_ref - budget
+                if stop_struct >= stop_for_rr:
+                    # 结构止损本身就够近，不用动
+                    stop_loss = stop_struct
+                    plan_rr_ok = True
+                elif stop_for_rr <= stop_near:
+                    # 收紧到刚好达标，且仍不为日内噪音级别
+                    stop_loss = stop_for_rr
+                    plan_rr_ok = True
+                else:
+                    # 要收进 2% 以内才达标：上方空间不足
+                    stop_loss = stop_struct
+                    plan_rr_ok = False
             else:
-                target_price = price * 1.06
-            invalidation = f"若跌破 {stop_loss:.2f} 则失效"
+                stop_loss = stop_struct
+                plan_rr_ok = False
+
+            stop_loss = round(float(stop_loss), 4)
+            target_price = round(float(target_price), 4)
+            invalidation = f"若跌破 {float(stop_loss):.2f} 则失效"
+            if not plan_rr_ok:
+                invalidation += "（上方空间不足，风险回报比不达标）"
         elif action in ("hold", "watch"):
             stop_loss = (support * 0.98) if support else (price * 0.94)
             target_price = (resistance * 0.99) if resistance else (price * 1.04)
@@ -543,7 +733,28 @@ def _build_plan(
         "trend": trend,
         "support": support,
         "resistance": resistance,
+        "atr_pct": round(float(atr_pct), 6) if price is not None else None,
+        # 风险回报比（按最差成交价 entry_high 计）。plan_rr_ok=False 表示上方空间不足、
+        # 收紧止损也凑不出门槛，计划本身不成立——下游据此封顶 quality、不进 active。
+        "risk_reward": _plan_risk_reward(entry_high, stop_loss, target_price),
+        "plan_rr_ok": bool(plan_rr_ok),
     }
+
+
+def _plan_risk_reward(
+    fill_ref: float | None, stop_loss: float | None, target_price: float | None
+) -> float | None:
+    """按最差成交价算风险回报比；任一缺失或风险非正时返回 None。"""
+    ref = _safe_float(fill_ref)
+    stop = _safe_float(stop_loss)
+    target = _safe_float(target_price)
+    if ref is None or stop is None or target is None or ref <= 0:
+        return None
+    risk = ref - stop
+    reward = target - ref
+    if risk <= 0:
+        return None
+    return round(reward / risk, 4)
 
 
 def _candidate_source_label(source: str) -> str:
@@ -559,23 +770,10 @@ def _strategy_labels(tags: list[str] | None) -> list[str]:
     return out
 
 
-# 涨幅过热硬阈值（%）——达到后不再给 buy/add active
-OVERHEAT_CHANGE_PCT = 9.5
 # 热榜至少有这么多活数据时，不再用历史/种子蓝筹补位
 LIVE_SCAN_FALLBACK_MIN = 1
-# 当日大跌硬阈值（%）——跌幅达到后不再给 buy/add active（日 K 技术标签反映的是昨天，接不住今天的下跌）
-CRASH_CHANGE_PCT = -7.0
-# A 股买入最低成交额（元）；低于此值视为薄票，不给 buy/add
-MIN_TURNOVER_FOR_BUY = 80_000_000.0
-# 日 K 多头/金叉必须叠加当日盘口，否则只是昨天的形态
-INTRADAY_CONFIRM_TAGS = frozenset({"momentum", "volume_breakout", "pullback"})
-INTRADAY_CONFIRM_CHANGE_PCT = 1.5
-INTRADAY_CONFIRM_VOLUME_RATIO = 1.2
-# 入场区间相对现价的合理宽度上下限
-_PLAN_BAND_WIDTH_MIN = 0.002  # 0.2%
-_PLAN_BAND_WIDTH_MAX = 0.08   # 8%
-# 计划中轴相对现价最大偏离倍数
-_PLAN_MID_PRICE_RATIO_MAX = 1.5
+# 其余阈值统一收口在 scoring_config（可用 PW_* 环境变量覆盖）：
+# 过热 / 当日大跌 / 最低成交额 / 盘中确认 / 计划结构 / active 定级。
 
 
 def _plan_quality(plan: dict | None, *, quote: dict | None = None) -> int:
@@ -603,7 +801,7 @@ def _plan_quality(plan: dict | None, *, quote: dict | None = None) -> int:
         else:
             mid = (entry_low + entry_high) / 2.0
             width = (entry_high - entry_low) / mid if mid > 0 else 0.0
-            if width < _PLAN_BAND_WIDTH_MIN or width > _PLAN_BAND_WIDTH_MAX:
+            if width < PLAN_BAND_WIDTH_MIN or width > PLAN_BAND_WIDTH_MAX:
                 structural_ok = False
             if stop_loss is not None and stop_loss >= mid:
                 structural_ok = False
@@ -612,8 +810,26 @@ def _plan_quality(plan: dict | None, *, quote: dict | None = None) -> int:
             price = _safe_float((quote or {}).get("current_price"))
             if price is not None and price > 0 and mid > 0:
                 ratio = max(price / mid, mid / price)
-                if ratio > _PLAN_MID_PRICE_RATIO_MAX:
+                if ratio > PLAN_MID_PRICE_RATIO_MAX:
                     structural_ok = False
+            # 风险回报比：目标太近 / 止损太远的计划即使字段齐全也不该满分。
+            # 改造前只查结构（目标>中价、止损<中价），"赚 0.5% 赔 6% " 能拿 100 分进
+            # active，后验评估里目标几乎必中、止损几乎打不到，胜率因此虚高。
+            #
+            # 风险基准用 entry_high（最差成交价），与 _build_plan、路径评估口径一致；
+            # 用 mid 会低估风险（实测同一计划 mid 口径 1.50、entry_high 口径 1.19）。
+            # 门槛留 0.1% 容差：_build_plan 是"恰好达标"地产出止损，浮点误差会让
+            # 0.744/0.496 算成 1.4999…，不加容差会把边界计划随机误杀。
+            if stop_loss is not None and target_price is not None:
+                risk = float(entry_high) - float(stop_loss)
+                reward = float(target_price) - float(entry_high)
+                if risk <= 0 or reward <= 0:
+                    structural_ok = False
+                elif (reward / risk) < float(PLAN_MIN_RISK_REWARD) * 0.999:
+                    structural_ok = False
+            # 计划显式声明"上方空间不足、凑不出 R:R"时直接否决，避免下游漏判。
+            if p.get("plan_rr_ok") is False:
+                structural_ok = False
     elif entry_low is None and entry_high is None:
         # 无入场区间时不做结构否决（观望类可无区间）
         pass
@@ -714,8 +930,132 @@ def cn_limit_pct(symbol: str | None) -> float:
 
 
 def overheat_change_pct(symbol: str | None) -> float:
-    """过热阈值：涨停幅度减 0.5 个百分点。"""
-    return cn_limit_pct(symbol) - 0.5
+    """过热阈值：涨停幅度减 OVERHEAT_DELTA_PCT 个百分点。"""
+    return cn_limit_pct(symbol) - float(OVERHEAT_DELTA_PCT)
+
+
+def market_phase(market: str | None) -> str:
+    """当前市场所处阶段：trading / break / pre_market / after_hours / closed / unknown。"""
+    try:
+        return trading_calendar.market_status(market or "CN")
+    except Exception:
+        return "unknown"
+
+
+def phase_has_intraday_data(phase: str) -> bool:
+    """当日是否已产生可用于"盘中确认"的数据。
+
+    盘前（pre_market）和非交易日（closed/unknown）拿到的 quote 实际是上一交易日的
+    收盘残留，此时用"当日涨幅 + 量比"做否决会把所有 buy/add 全部打成"盘中未确认"，
+    09:15 那轮因此长期产出 0 条机会。
+    """
+    return phase in INTRADAY_PHASES
+
+
+def phase_allows_freeze(phase: str) -> bool:
+    """只有盘中/午休轮次可以冻结 point-in-time 状态。
+
+    收盘后（after_hours）已经包含当日涨跌结果，用它冻结就是前视；盘前更是昨天的数据。
+    """
+    return phase in FREEZE_PHASES
+
+
+def _parse_stamp(value) -> datetime | None:
+    """把各种时间写法（datetime / date / ISO 字符串）统一成带时区 datetime。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=utc_now().tzinfo)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=utc_now().tzinfo)
+    text = str(value).strip().replace("/", "-")
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            return datetime.fromisoformat(text).replace(tzinfo=utc_now().tzinfo)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=utc_now().tzinfo)
+    except ValueError:
+        return None
+
+
+def quote_is_stale(quote: dict | None, seed_meta: dict | None = None) -> bool:
+    """行情是否已过期。
+
+    补位行情来自历史候选或盘中建议的 meta，行情源挂掉时可能是几小时前的价格，
+    拿它算出的"回踩支撑 / 建仓区间"会误导，因此超过 STALE_QUOTE_MINUTES 就不允许开仓。
+    时间戳缺失时不做拦截（否则会把所有历史数据一律判死）。
+    """
+    q = quote if isinstance(quote, dict) else {}
+    m = seed_meta if isinstance(seed_meta, dict) else {}
+    stamp = (
+        _parse_stamp(q.get("quote_at"))
+        or _parse_stamp(m.get("collected_at"))
+        or _parse_stamp(m.get("fallback_snapshot_date"))
+    )
+    if stamp is None:
+        return False
+    age_minutes = (utc_now() - stamp).total_seconds() / 60.0
+    return age_minutes > float(STALE_QUOTE_MINUTES)
+
+
+def _compact_seed_meta(meta: dict | None) -> dict:
+    """落库前裁剪上游 meta（与 strategy_engine._compact_source_meta 的白名单一致）。
+
+    上游建议的 meta 可能带整份 context/kline，逐日累积会把 entry_candidates 撑大；
+    这里只留下游真正会用到的字段。
+    """
+    raw = meta if isinstance(meta, dict) else {}
+    if not raw:
+        return {}
+    out: dict[str, object] = {}
+    for key in (
+        "trace_id",
+        "context_quality_score",
+        "trigger_price",
+        "entry_low",
+        "entry_high",
+        "stop_loss",
+        "target_price",
+        "invalidation",
+        "source",
+        "fill_source",
+        "collected_at",
+        "fallback_snapshot_date",
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            out[key] = text[:240]
+        else:
+            out[key] = value
+    quote = raw.get("quote") if isinstance(raw.get("quote"), dict) else {}
+    if quote:
+        out["quote"] = {
+            "current_price": _safe_float(quote.get("current_price")),
+            "change_pct": _safe_float(quote.get("change_pct")),
+            "turnover": _safe_float(quote.get("turnover")),
+            "volume": _safe_float(quote.get("volume")),
+        }
+    plan = raw.get("plan") if isinstance(raw.get("plan"), dict) else {}
+    if plan:
+        out["plan"] = {
+            "entry_low": _safe_float(plan.get("entry_low")),
+            "entry_high": _safe_float(plan.get("entry_high")),
+            "stop_loss": _safe_float(plan.get("stop_loss")),
+            "target_price": _safe_float(plan.get("target_price")),
+            "invalidation": str(plan.get("invalidation") or "").strip()[:160],
+            # R:R 判定结果要跟着 plan 一起走，否则从 seed 恢复的计划无法辨别
+            # "上方空间不足"而被下游误当成可执行。
+            "risk_reward": _safe_float(plan.get("risk_reward")),
+            "plan_rr_ok": plan.get("plan_rr_ok"),
+        }
+    return out
 
 
 def _kline_unavailable(kline: dict | None) -> bool:
@@ -869,41 +1209,10 @@ def _score_market_scan_candidate(
     symbol: str = "",
 ) -> tuple[float, list[str]]:
     score = ACTION_BASE_SCORE.get((action or "").strip().lower(), 45.0)
-    evidence: list[str] = []
-
-    q = quote or {}
-    k = kline or {}
-    tags = strategy_tags or []
-
-    if tags:
-        score += min(8, len(tags) * 2)
-        evidence.append("策略信号: " + " / ".join(_strategy_labels(tags[:3])))
-
-    pct = _safe_float(q.get("change_pct"))
-    if pct is not None:
-        if pct >= float(overheat_change_pct(symbol)):
-            score -= 8
-            evidence.append(f"涨幅过热({pct:+.2f}%)")
-        elif 1 <= pct <= 7:
-            score += 2
-            evidence.append(f"价格动量({pct:+.2f}%)")
-
-    turnover = _safe_float(q.get("turnover"))
-    if turnover is not None:
-        if turnover >= 3e9:
-            score += 3
-            evidence.append("成交额高")
-        elif turnover >= 1e9:
-            score += 1
-
-    trend = (k.get("trend") or "").strip()
-    if trend == "多头排列":
-        score += 5
-        evidence.append("均线多头排列")
-    elif trend == "空头排列":
-        score -= 6
-        evidence.append("均线空头排列")
-
+    struct_score, evidence = _score_structure_signals(
+        quote=quote, kline=kline, symbol=symbol, strategy_tags=strategy_tags
+    )
+    score += struct_score
     score = _clamp(score, 0.0, 100.0)
     return score, evidence[:8]
 
@@ -915,7 +1224,7 @@ def _load_market_scan_history_inputs(
         return {}
 
     mkt = (market or "CN").strip().upper()
-    cutoff = (date.today() - timedelta(days=max(1, int(max_days)))).strftime("%Y-%m-%d")
+    cutoff = (app_now().date() - timedelta(days=max(1, int(max_days)))).strftime("%Y-%m-%d")
     db = SessionLocal()
     try:
         rows = (
@@ -998,7 +1307,7 @@ def _load_market_scan_snapshot_inputs(
         return {}
 
     mkt = (market or "CN").strip().upper()
-    cutoff = (date.today() - timedelta(days=max(1, int(max_days)))).strftime("%Y-%m-%d")
+    cutoff = (app_now().date() - timedelta(days=max(1, int(max_days)))).strftime("%Y-%m-%d")
     db = SessionLocal()
     try:
         rows = (
@@ -1213,50 +1522,77 @@ def _load_market_scan_inputs(limit_per_market: int = 60, *, markets: list[str] |
             logger.warning(f"市场扫描涨幅榜失败({market}): {e}")
             gainers = []
 
-        merged = list(turnover or []) + list(gainers or [])
-        if not merged:
-            logger.warning("市场扫描热榜全空: market=%s，将回退历史/快照/种子", market)
+        # 成交榜 / 涨幅榜按配额各占一半：此前把两榜拼在一起遍历，成交榜一条就能
+        # 把 safe_limit 占满并 break，涨幅榜形同废榜（fetch_limit 恒 > limit）。
+        quota_turnover = max(1, int(round(safe_limit * 0.6)))
+        quota_gainers = max(1, safe_limit - quota_turnover)
         dropped_crash = 0
         dropped_junk = 0
-        for row in merged:
-            symbol = (getattr(row, "symbol", "") or "").strip()
-            if not symbol:
-                continue
-            quote = {
-                "current_price": _safe_float(getattr(row, "price", None)),
-                "change_pct": _safe_float(getattr(row, "change_pct", None)),
-                "turnover": _safe_float(getattr(row, "turnover", None)),
-                "volume": _safe_float(getattr(row, "volume", None)),
-            }
-            if _is_crash_change(quote.get("change_pct")):
-                dropped_crash += 1
-                continue
-            if market == "CN" and not is_cn_list_symbol(symbol):
-                dropped_junk += 1
-                continue
-            key = f"{market}:{symbol}"
-            if key in result:
-                exist_quote = result[key].get("quote_seed") or {}
-                if _safe_float(exist_quote.get("turnover")) is None and quote.get("turnover") is not None:
-                    result[key]["quote_seed"] = quote
-                continue
-            result[key] = {
-                "symbol": symbol,
-                "market": market,
-                "stock_name": (getattr(row, "name", "") or symbol).strip(),
-                "candidate_source": "market_scan",
-                "source_agent": "market_scan",
-                "source_suggestion_id": None,
-                "source_trace_id": "",
-                "quote_seed": quote,
-                "meta": {
-                    "source": "market_scan",
-                    "fill_source": "live",
-                    "collected_at": to_iso_with_tz(utc_now()),
-                },
-            }
-            if len([k for k in result if k.startswith(f"{market}:")]) >= safe_limit:
-                break
+
+        def _absorb(rows, quota: int) -> int:
+            """从 rows 里吸收最多 quota 只新票，返回实际新增数。"""
+            nonlocal dropped_crash, dropped_junk
+            added = 0
+            for row in rows or []:
+                if added >= quota:
+                    break
+                symbol = (getattr(row, "symbol", "") or "").strip()
+                if not symbol:
+                    continue
+                quote = {
+                    "current_price": _safe_float(getattr(row, "price", None)),
+                    "change_pct": _safe_float(getattr(row, "change_pct", None)),
+                    "turnover": _safe_float(getattr(row, "turnover", None)),
+                    "volume": _safe_float(getattr(row, "volume", None)),
+                }
+                if _is_crash_change(quote.get("change_pct")):
+                    dropped_crash += 1
+                    continue
+                if market == "CN" and not is_cn_list_symbol(symbol):
+                    dropped_junk += 1
+                    continue
+                key = f"{market}:{symbol}"
+                if key in result:
+                    exist_quote = result[key].get("quote_seed") or {}
+                    if (
+                        _safe_float(exist_quote.get("turnover")) is None
+                        and quote.get("turnover") is not None
+                    ):
+                        result[key]["quote_seed"] = quote
+                    continue
+                result[key] = {
+                    "symbol": symbol,
+                    "market": market,
+                    "stock_name": (getattr(row, "name", "") or symbol).strip(),
+                    "candidate_source": "market_scan",
+                    "source_agent": "market_scan",
+                    "source_suggestion_id": None,
+                    "source_trace_id": "",
+                    "quote_seed": quote,
+                    "meta": {
+                        "source": "market_scan",
+                        "fill_source": "live",
+                        "collected_at": to_iso_with_tz(utc_now()),
+                    },
+                }
+                added += 1
+            return added
+
+        added_turnover = _absorb(turnover, quota_turnover)
+        added_gainers = _absorb(gainers, quota_gainers)
+        # 两榜都不足额时互相回填，尽量把名额用满（仍按成交榜优先）。
+        if len([k for k in result if k.startswith(f"{market}:")]) < safe_limit:
+            _absorb(turnover, safe_limit)
+        if len([k for k in result if k.startswith(f"{market}:")]) < safe_limit:
+            _absorb(gainers, safe_limit)
+        if not (turnover or gainers):
+            logger.warning("市场扫描热榜全空: market=%s，将回退历史/快照/种子", market)
+        logger.debug(
+            "市场扫描热榜合并: market=%s turnover=%s gainers=%s",
+            market,
+            added_turnover,
+            added_gainers,
+        )
         if dropped_crash:
             logger.info("市场扫描剔除当日大跌: market=%s dropped=%s", market, dropped_crash)
         if dropped_junk:
@@ -1434,6 +1770,8 @@ def _format_candidate_row(row: EntryCandidate) -> dict:
         "evidence": row.evidence or [],
         "plan": row.plan or {},
         "meta": row.meta or {},
+        "frozen": row.frozen or {},
+        "preview": bool((row.meta or {}).get("preview")) if isinstance(row.meta, dict) else False,
         "created_at": _fmt(row.created_at),
         "updated_at": _fmt(row.updated_at),
     }
@@ -1488,10 +1826,12 @@ def refresh_entry_candidates(
 ) -> dict:
     from src.modules.strategy.opportunity_markets import resolve_opportunity_markets
 
-    snapshot = (snapshot_date or date.today().strftime("%Y-%m-%d")).strip()
+    snapshot = (snapshot_date or app_now().date().strftime("%Y-%m-%d")).strip()
     markets = resolve_opportunity_markets(markets)
     if markets == []:
         return {"snapshot_date": snapshot, "count": 0, "items": []}
+    # 按市场判断当前阶段：盘前/非交易日拿不到当日盘口，收盘后已含当日结果。
+    market_phases = {m: market_phase(m) for m in markets}
     suggestions = _load_latest_suggestions(limit=max_inputs)
     suggestions = [s for s in suggestions if s.stock_market in markets]
     scan_kwargs = {"markets": markets}
@@ -1600,12 +1940,27 @@ def refresh_entry_candidates(
         )
         if safe_cap > 0:
             fetch_candidates = fetch_candidates[:safe_cap]
-        for key in fetch_candidates:
+
+        # 日 K 原来逐只串行拉，首轮刷新要 20-40s。KlineCollector 内部自带按标的
+        # 的并发合并锁与正/负缓存，这里用少量线程并发即可，不需要额外去重。
+        def _fetch_one(key: str) -> tuple[str, dict]:
             market, symbol = key.split(":", 1)
             try:
-                kline_summary_map[key] = KlineCollector(_to_market(market)).get_kline_summary(symbol)
+                return key, KlineCollector(_to_market(market)).get_kline_summary(symbol)
             except Exception:
-                kline_summary_map[key] = {}
+                return key, {}
+
+        workers = max(1, min(int(KLINE_FETCH_WORKERS), len(fetch_candidates)))
+        if workers <= 1:
+            for key in fetch_candidates:
+                k, summary = _fetch_one(key)
+                kline_summary_map[k] = summary
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="kline") as pool:
+                for k, summary in pool.map(_fetch_one, fetch_candidates):
+                    kline_summary_map[k] = summary
     for key in key_set:
         if key not in kline_summary_map:
             kline_summary_map[key] = {}
@@ -1660,18 +2015,23 @@ def refresh_entry_candidates(
                 action_label = (inp.get("action_label") or "观望").strip()
                 signal = (inp.get("signal") or "").strip()
                 reason = (inp.get("reason") or "").strip()
-                score, evidence = _score_suggestion(
-                    action=action,
-                    suggestion=suggestion_obj,
-                    quote=quote,
-                    kline=kline,
-                )
+                # 从 K 线反推的策略标签要先补齐再打分：两个候选池共用同一张
+                # 结构信号权重表，标签也是其中一项，否则自选池的标签不参与计分、
+                # 热榜池参与，尺度又分叉了。
                 if (kline.get("trend") or "").strip() == "多头排列":
                     strategy_tags.append("trend_follow")
                 if (kline.get("macd_cross") or "").strip() == "金叉":
                     strategy_tags.append("macd_golden")
                 if (_safe_float(kline.get("volume_ratio")) or 0) >= 1.8:
                     strategy_tags.append("volume_breakout")
+                score, evidence = _score_suggestion(
+                    action=action,
+                    suggestion=suggestion_obj,
+                    quote=quote,
+                    kline=kline,
+                    strategy_tags=strategy_tags,
+                    symbol=symbol,
+                )
             else:
                 seeded_action = (inp.get("action") or "").strip().lower()
                 decision = _derive_market_scan_decision(
@@ -1740,6 +2100,9 @@ def refresh_entry_candidates(
             quality = _plan_quality(plan, quote=quote)
             confidence = round(score / 100.0, 3)
 
+            phase = market_phases.get(market, "unknown")
+            quote_stale = quote_is_stale(quote, inp.get("meta") or {})
+
             # 过热/大跌/薄票硬否决：即使上游 seed 给了 buy，也不进 active
             veto = None
             turnover = _safe_float(quote.get("turnover"))
@@ -1749,7 +2112,15 @@ def refresh_entry_candidates(
                 veto = ("大跌观望", f"当日大跌({change_pct:+.2f}%)")
             elif turnover is not None and turnover < float(MIN_TURNOVER_FOR_BUY):
                 veto = ("流动性观望", f"成交额过低({turnover / 1e8:.2f}亿)")
-            elif not has_intraday_confirm(strategy_tags, quote, kline):
+            elif quote_stale and phase_has_intraday_data(phase):
+                # 只在"本该有当日行情"的时段判定过期：盘前/非交易日的补位行情
+                # 天然是上一交易日的，不能据此否决。
+                veto = ("行情过期", f"行情超过 {int(STALE_QUOTE_MINUTES)} 分钟未更新")
+            elif phase_has_intraday_data(phase) and not has_intraday_confirm(
+                strategy_tags, quote, kline
+            ):
+                # 只在当日已有盘口数据时要求确认：盘前/非交易日拿到的是上一交易日
+                # 的残留数据，用它否决会让 09:15 那轮永远 0 条机会。
                 veto = ("盘中未确认", "日K形态缺少当日盘口确认")
             fill_source = str((inp.get("meta") or {}).get("fill_source") or "live")
             if fill_source != "live" and action in ("buy", "add"):
@@ -1761,10 +2132,27 @@ def refresh_entry_candidates(
                 if veto[1] not in evidence:
                     evidence.append(veto[1])
 
+            # 盘前轮次：保留为"今日预演"名单（标注待确认），不写 frozen，
+            # 开盘后由后一轮刷新重新判定；paper trading 侧另有 preview 拦截。
+            preview = phase == "pre_market" and action in ("buy", "add")
+
             status = "inactive"
-            threshold = 62 if candidate_source in ("market_scan", "mixed") else 55
-            if action in ("buy", "add") and quality >= 90 and score >= threshold:
+            threshold = (
+                ACTIVE_SCORE_MARKET_SCAN
+                if candidate_source in ("market_scan", "mixed")
+                else ACTIVE_SCORE_WATCHLIST
+            )
+            if (
+                action in ("buy", "add")
+                and quality >= MIN_PLAN_QUALITY_FOR_ACTIVE
+                and score >= threshold
+            ):
                 status = "active"
+                if preview:
+                    action_label = f"{action_label}(盘前待确认)"
+                    evidence = list(evidence or [])
+                    if "盘前预演：开盘后需当日盘口确认" not in evidence:
+                        evidence.append("盘前预演：开盘后需当日盘口确认")
 
             row = existing_by_key.get(key)
             if row is None:
@@ -1814,12 +2202,41 @@ def refresh_entry_candidates(
                         "volume_ratio": kline.get("volume_ratio"),
                         "support": kline.get("support"),
                         "resistance": kline.get("resistance"),
+                        # 策略层 alpha 因子要用独立量价信息，不能再拿 base_score 线性映射：
+                        # 这几个字段是 alpha 的原料，缺了就只能退化成"候选分的拷贝"。
+                        "atr_pct": kline.get("atr_pct"),
+                        "change_5d": kline.get("change_5d"),
+                        "change_20d": kline.get("change_20d"),
+                        "ma20": kline.get("ma20"),
                     },
                     "strategy_tags": strategy_tags,
                     "is_holding_snapshot": bool(is_holding),
-                    "source_meta": inp.get("meta") or {},
+                    "phase": phase,
+                    "preview": bool(preview),
+                    "quote_stale": bool(quote_stale),
+                    "source_meta": _compact_seed_meta(inp.get("meta")),
                 }
             )
+            # point-in-time 冻结：只认当日首个"盘中轮次"的最终可执行状态，
+            # 盘前/收盘后都不写，后验评估因此不会吃到收盘后才成立的信息。
+            if not isinstance(row.frozen, dict) or not row.frozen:
+                if phase_allows_freeze(phase) and status == "active":
+                    row.frozen = to_jsonable(
+                        {
+                            "status": status,
+                            "action": action,
+                            "action_label": action_label,
+                            "score": round(float(score or 0.0), 4),
+                            "plan_quality": int(quality),
+                            "entry_low": _safe_float(plan.get("entry_low")),
+                            "entry_high": _safe_float(plan.get("entry_high")),
+                            "stop_loss": _safe_float(plan.get("stop_loss")),
+                            "target_price": _safe_float(plan.get("target_price")),
+                            "phase": phase,
+                            "snapshot_date": snapshot,
+                            "frozen_at": to_iso_with_tz(utc_now()),
+                        }
+                    )
             row.updated_at = utc_now()
             touched_keys.add(key)
             items.append(_format_candidate_row(row))
@@ -1906,6 +2323,16 @@ def list_entry_candidates(
             elif h == "unheld":
                 q = q.filter(EntryCandidate.is_holding_snapshot.is_(False))
             q = q.filter(EntryCandidate.score >= float(min_score or 0))
+            tag = (strategy or "").strip()
+            if tag:
+                # strategy_tags 是 JSON 数组，SQLite 下按文本粗筛，再由调用方做精确比对。
+                # 之前只在 limit 之后用 Python 过滤，选具体策略 + 高 min_score 时
+                # 实际返回条数会明显少于 limit。
+                q = q.filter(
+                    func.replace(cast(EntryCandidate.strategy_tags, String), " ", "").like(
+                        f'%"{tag}"%'
+                    )
+                )
             rows = (
                 q.order_by(
                     case(
@@ -1916,7 +2343,7 @@ def list_entry_candidates(
                     EntryCandidate.score.desc(),
                     EntryCandidate.updated_at.desc(),
                 )
-                .limit(max(20, int(limit) * 4))
+                .limit(max(20, int(limit) * 2))
                 .all()
             )
             return snapshot, rows
@@ -1936,6 +2363,97 @@ def list_entry_candidates(
 
 
 
+def resolve_evaluation_state(row) -> dict | None:
+    """后验评估该用哪一版状态：优先当天首个盘中轮次的 frozen，其次当前值。
+
+    返回 ``None`` 表示该行在 T 日不构成"机会"，不应参与评估。
+
+    - 有 frozen：只认冻结那一刻的判定（真正 point-in-time）。
+    - 无 frozen 且快照日 >= 冻结上线日：**排除**。这些行是"当时不是 active、收盘后
+      才被 22:00 那轮改判成 active"的，用它们参与评估等于把收盘结果泄漏进决策。
+    - 无 frozen 且快照日更早：迁移前的历史数据，回退到当前字段并标记
+      ``point_in_time=False``，保持可评估但可区分。
+    """
+    frozen = getattr(row, "frozen", None)
+    frozen = frozen if isinstance(frozen, dict) else {}
+    if frozen:
+        if (frozen.get("status") or "") != "active":
+            return None
+        return {
+            "status": "active",
+            "action": frozen.get("action") or getattr(row, "action", "") or "",
+            "action_label": frozen.get("action_label") or getattr(row, "action_label", "") or "",
+            "score": _safe_float(frozen.get("score")),
+            "entry_low": _safe_float(frozen.get("entry_low")),
+            "entry_high": _safe_float(frozen.get("entry_high")),
+            "stop_loss": _safe_float(frozen.get("stop_loss")),
+            "target_price": _safe_float(frozen.get("target_price")),
+            "point_in_time": True,
+            "frozen_at": frozen.get("frozen_at") or "",
+            "frozen_phase": frozen.get("phase") or "",
+        }
+    if (getattr(row, "status", "") or "") != "active":
+        return None
+    snapshot = str(getattr(row, "snapshot_date", "") or "").strip()
+    if POINT_IN_TIME_START and snapshot >= POINT_IN_TIME_START:
+        return None
+    return {
+        "status": getattr(row, "status", ""),
+        "action": getattr(row, "action", "") or "",
+        "action_label": getattr(row, "action_label", "") or "",
+        "score": _safe_float(getattr(row, "score", None)),
+        "entry_low": getattr(row, "entry_low", None),
+        "entry_high": getattr(row, "entry_high", None),
+        "stop_loss": getattr(row, "stop_loss", None),
+        "target_price": getattr(row, "target_price", None),
+        "point_in_time": False,
+        "frozen_at": "",
+        "frozen_phase": "",
+    }
+
+
+def prefetch_evaluation_klines(
+    requests: dict[tuple[str, str], int], *, max_workers: int | None = None
+) -> dict[tuple[str, str], list]:
+    """按 (symbol, market) 并发拉取评估所需日线。
+
+    ``requests`` 的 value 是需要回溯的日历天数（同一 symbol 取最大值）。
+    评估阶段此前是串行逐只拉，limit 400/800 条信号时要跑几分钟；刷新阶段早已改成
+    线程池，这里补齐。候选层与策略层的评估共用本函数，同一批票只拉一次。
+    """
+    out: dict[tuple[str, str], list] = {}
+    if not requests:
+        return out
+
+    def _fetch(item: tuple[tuple[str, str], int]) -> tuple[tuple[str, str], list]:
+        key, lookback = item
+        symbol, market = key
+        if not symbol:
+            return key, []
+        try:
+            rows = KlineCollector(_to_market(market)).get_klines(
+                symbol, days=min(max(1, int(lookback)), 600)
+            )
+            return key, rows
+        except Exception:
+            return key, []
+
+    items = list(requests.items())
+    workers = max_workers if max_workers is not None else int(KLINE_FETCH_WORKERS)
+    workers = max(1, min(int(workers), len(items)))
+    if workers <= 1:
+        for item in items:
+            k, v = _fetch(item)
+            out[k] = v
+        return out
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="eval-kline") as pool:
+        for k, v in pool.map(_fetch, items):
+            out[k] = v
+    return out
+
+
 def evaluate_entry_candidate_outcomes(
     *,
     horizons: tuple[int, ...] = (1, 3, 5, 10),
@@ -1949,6 +2467,7 @@ def evaluate_entry_candidate_outcomes(
         "skipped_not_due": 0,
         "skipped_no_price": 0,
         "skipped_no_base_price": 0,
+        "skipped_not_filled": 0,
     }
     safe_horizons = sorted({max(1, int(h)) for h in horizons if int(h) > 0})
     if not safe_horizons:
@@ -1956,15 +2475,20 @@ def evaluate_entry_candidate_outcomes(
 
     db = SessionLocal()
     try:
-        cutoff = date.today() - timedelta(days=max(7, int(snapshot_days)))
+        cutoff = app_now().date() - timedelta(days=max(7, int(snapshot_days)))
+        # 评估对象 = "当日首个盘中轮次判定为 active" 的票（frozen），
+        # 兼容迁移前没有 frozen 的历史数据（回退到当前 status）。
         candidates = (
             db.query(EntryCandidate)
             .filter(
-                EntryCandidate.status == "active",
                 EntryCandidate.snapshot_date >= cutoff.strftime("%Y-%m-%d"),
+                or_(
+                    EntryCandidate.status == "active",
+                    func.length(func.coalesce(EntryCandidate.frozen, "")) > 2,
+                ),
             )
             .order_by(EntryCandidate.snapshot_date.desc(), EntryCandidate.score.desc())
-            .limit(max(1, int(limit)))
+            .limit(max(1, int(limit)) * 4)
             .all()
         )
         stats["total_candidates"] = len(candidates)
@@ -1978,8 +2502,20 @@ def evaluate_entry_candidate_outcomes(
         )
         existing = {(int(cid), int(h)) for cid, h in existing_rows}
 
-        today = date.today()
-        kline_cache: dict[tuple[str, str], list] = {}
+        today = app_now().date()
+        # 先扫一遍收集 (symbol, market) 与所需回溯天数，并发预取。
+        # 评估循环里按需串行拉 K 线时，limit=400 的场景要跑好几分钟。
+        kline_requests: dict[tuple[str, str], int] = {}
+        for c in candidates:
+            snap_day = _parse_day(c.snapshot_date)
+            if snap_day is None:
+                continue
+            if resolve_evaluation_state(c) is None:
+                continue
+            key = ((c.stock_symbol or "").strip(), (c.stock_market or "CN").strip().upper())
+            lookback = max(120, (today - snap_day).days + 30)
+            kline_requests[key] = max(kline_requests.get(key, 0), lookback)
+        kline_cache = prefetch_evaluation_klines(kline_requests)
         pending = 0  # 分批提交计数,缩短写事务窗口
 
         for c in candidates:
@@ -1987,68 +2523,53 @@ def evaluate_entry_candidate_outcomes(
             if snap_day is None:
                 continue
 
+            frozen = c.frozen if isinstance(c.frozen, dict) else {}
+            eval_state = resolve_evaluation_state(c)
+            if eval_state is None:
+                # 当天盘中首个快照并非 active（或迁移前数据也不是 active）：
+                # 这只票在 T 日不构成机会，不能用收盘后重刷出来的 active 结果参与评估。
+                continue
+            eval_status = eval_state["status"]
+            eval_action = eval_state["action"]
+            eval_action_label = eval_state["action_label"]
+            eval_score = eval_state["score"]
+            eval_entry_low = eval_state["entry_low"]
+            eval_entry_high = eval_state["entry_high"]
+            eval_stop = eval_state["stop_loss"]
+            eval_target = eval_state["target_price"]
+            point_in_time = bool(eval_state["point_in_time"])
+
             key = ((c.stock_symbol or "").strip(), (c.stock_market or "CN").strip().upper())
-            if key not in kline_cache:
-                try:
-                    lookback = max(120, (today - snap_day).days + 30)
-                    kline_cache[key] = KlineCollector(_to_market(key[1])).get_klines(
-                        key[0], days=min(lookback, 600)
-                    )
-                except Exception:
-                    kline_cache[key] = []
-            klines = kline_cache[key]
+            klines = kline_cache.get(key, [])
 
             for horizon in safe_horizons:
                 if (c.id, horizon) in existing:
                     continue
-                target_day = snap_day + timedelta(days=horizon)
-                if target_day > today:
+                # 逐 bar 取路径：能同时回答"到底有没有成交"和"先触目标还是先触止损"。
+                bars = forward_bars(klines, snap_day, horizon, c.stock_market)
+                if bars is None:
                     stats["skipped_not_due"] += 1
                     continue
-
-                bar = completed_outcome_bar(klines, snap_day, horizon, c.stock_market)
-                if bar is None:
-                    stats["skipped_not_due"] += 1
-                    continue
-                target_day, outcome_price = bar
                 stats["eligible"] += 1
-
-                base_price = None
-                if c.entry_low is not None and c.entry_high is not None:
-                    base_price = (float(c.entry_low) + float(c.entry_high)) / 2
-                elif c.entry_high is not None:
-                    base_price = float(c.entry_high)
-                elif c.entry_low is not None:
-                    base_price = float(c.entry_low)
-                if base_price is None:
-                    meta = c.meta if isinstance(c.meta, dict) else {}
-                    quote = meta.get("quote") if isinstance(meta.get("quote"), dict) else {}
-                    base_price = _safe_float(quote.get("current_price"))
-                if base_price is None:
-                    base_price = _pick_close_on_or_before(klines, snap_day)
-                if base_price is None or base_price <= 0:
-                    stats["skipped_no_base_price"] += 1
-                    status = "no_base_price"
-                    ret = None
-                else:
-                    ret = (outcome_price - base_price) / base_price * 100.0
-                    if c.target_price is not None and outcome_price >= float(c.target_price):
-                        status = "hit_target"
-                    elif c.stop_loss is not None and outcome_price <= float(c.stop_loss):
-                        status = "hit_stop"
-                    else:
-                        status = "evaluated"
-
-                hit_target = (
-                    bool(c.target_price is not None and outcome_price >= float(c.target_price))
-                    if status != "no_base_price"
-                    else None
+                outcome = evaluate_plan_path(
+                    bars,
+                    entry_low=eval_entry_low,
+                    entry_high=eval_entry_high,
+                    stop_loss=eval_stop,
+                    target_price=eval_target,
                 )
-                hit_stop = (
-                    bool(c.stop_loss is not None and outcome_price <= float(c.stop_loss))
-                    if status != "no_base_price"
-                    else None
-                )
+                target_day = outcome["outcome_day"] or bars[-1]["date"]
+                status = outcome["status"]
+                ret = outcome["return_pct"]
+                base_price = outcome["fill_price"]
+                outcome_price = outcome["outcome_price"]
+                filled = bool(outcome["filled"])
+                hit_target = True if status == "hit_target" else (False if filled else None)
+                hit_stop = True if status == "hit_stop" else (False if filled else None)
+                if status == "not_filled":
+                    # 价格从没回到入场区间：记一行用于诊断"计划挂太高/太窄"，
+                    # 但 base_price/收益留空，不参与胜率分母。
+                    stats["skipped_not_filled"] = int(stats.get("skipped_not_filled", 0)) + 1
 
                 row = EntryCandidateOutcome(
                     candidate_id=c.id,
@@ -2068,9 +2589,19 @@ def evaluate_entry_candidate_outcomes(
                     meta=to_jsonable(
                         {
                             "horizon_unit": "trading_days",
-                            "candidate_score": float(c.score or 0),
-                            "action": c.action or "",
-                            "action_label": c.action_label or "",
+                            "candidate_score": float(eval_score or 0),
+                            "action": eval_action,
+                            "action_label": eval_action_label,
+                            "point_in_time": point_in_time,
+                            "frozen_at": (frozen.get("frozen_at") if frozen else ""),
+                            "frozen_phase": (frozen.get("phase") if frozen else ""),
+                            # 路径判定留痕：filled=False 的样本收益不可用；
+                            # first_hit 记录是哪一侧先被触发，便于核对胜率口径。
+                            "path_aware": True,
+                            "filled": filled,
+                            "fill_day": outcome_day_str(outcome["fill_day"]),
+                            "first_hit": outcome["first_hit"] or "",
+                            "exit_day": target_day.strftime("%Y-%m-%d"),
                         }
                     ),
                     evaluated_at=utc_now(),

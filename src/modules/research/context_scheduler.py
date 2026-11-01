@@ -11,6 +11,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.platform.marketdata.collectors.kline_collector import kline_source
 from src.modules.research.context_store import cleanup_context_data
 from src.modules.strategy.entry_candidates import evaluate_entry_candidate_outcomes
+from src.modules.strategy import refresh_state
+from src.modules.strategy.retention import cleanup_strategy_data
 from src.modules.research.prediction_outcome import evaluate_pending_prediction_outcomes
 from src.modules.strategy.strategy_engine import (
     evaluate_strategy_outcomes,
@@ -69,11 +71,23 @@ class ContextMaintenanceScheduler:
         if self._evaluating:
             logger.debug("[上下文维护] 上一轮后验评估仍在执行，跳过本轮")
             return
+        # 与 API 手动触发的 /outcomes/evaluate 共用 evaluate 锁：两边同时跑会
+        # 各自查"已评估"集合漏掉对方刚插入的行，撞唯一约束后整批 rollback。
+        started, _state = refresh_state.try_begin(source="scheduler", name="evaluate")
+        if not started:
+            logger.debug("[上下文维护] 已有后验评估在执行，跳过本轮")
+            return
         self._evaluating = True
         try:
             with track_job_run("context", "context_maintenance_evaluate") as job_summary:
                 await self._run_evaluate_body(job_summary)
+            evaluated = int(
+                (job_summary.get("entry_candidates") or {}).get("evaluated", 0)
+                or 0
+            ) + int((job_summary.get("strategy_outcomes") or {}).get("evaluated", 0) or 0)
+            refresh_state.finish(count=evaluated, name="evaluate")
         except Exception as e:
+            refresh_state.finish(error=str(e), name="evaluate")
             logger.exception(f"[上下文维护] 后验评估异常: {e}")
         finally:
             self._evaluating = False
@@ -189,11 +203,14 @@ class ContextMaintenanceScheduler:
                 job_runs_deleted = await asyncio.to_thread(
                     cleanup_job_runs, retention_days=30
                 )
+                # 策略链路（候选/信号/评估/热榜快照）此前完全没清理，一年后是几十万行。
+                strategy_deleted = await asyncio.to_thread(cleanup_strategy_data)
                 summary["context_deleted"] = deleted if isinstance(deleted, dict) else {"deleted": deleted}
+                summary["strategy_deleted"] = strategy_deleted
                 summary["scheduler_job_runs_deleted"] = int(job_runs_deleted or 0)
                 has_work = bool(
                     deleted and any(deleted.values()) if isinstance(deleted, dict) else deleted
-                ) or bool(job_runs_deleted)
+                ) or bool(job_runs_deleted) or bool(strategy_deleted and any(strategy_deleted.values()))
                 if not has_work:
                     summary["_idle"] = True
                 level = logging.INFO if has_work else logging.DEBUG
@@ -204,6 +221,28 @@ class ContextMaintenanceScheduler:
             self._cleaning = False
 
     async def evaluate_once(self) -> dict:
+        started, state = refresh_state.try_begin(source="manual", name="evaluate")
+        if not started:
+            return {
+                "queued": False,
+                "running": True,
+                "skipped": True,
+                "message": "后验评估正在执行中，本次跳过",
+                "state": state,
+            }
+        try:
+            result = await self._run_evaluate_once_body()
+            refresh_state.finish(
+                count=int((result.get("entry_candidates") or {}).get("evaluated", 0) or 0)
+                + int((result.get("strategy_outcomes") or {}).get("evaluated", 0) or 0),
+                name="evaluate",
+            )
+            return result
+        except Exception as e:
+            refresh_state.finish(error=str(e), name="evaluate")
+            raise
+
+    async def _run_evaluate_once_body(self) -> dict:
         agent_task = asyncio.to_thread(evaluate_pending_prediction_outcomes)
         candidate_task = asyncio.to_thread(
             evaluate_entry_candidate_outcomes,
@@ -251,8 +290,11 @@ class ContextMaintenanceScheduler:
         if not markets:
             logger.debug("[上下文维护] 非交易日，跳过机会刷新")
             return
-        if self._refreshing:
-            logger.debug("[上下文维护] 上一轮机会刷新仍在执行，跳过本轮")
+        # 与手动刷新、启动补跑共用同一把锁：此前 API 用模块级状态、调度器用
+        # self._refreshing，两处互不知情，撞在同一分钟会重复拉行情并争抢写锁。
+        started, _state = refresh_state.try_begin(source="scheduler")
+        if not started:
+            logger.debug("[上下文维护] 已有机会刷新在执行，跳过本轮")
             return
         self._refreshing = True
         try:
@@ -279,8 +321,13 @@ class ContextMaintenanceScheduler:
                     result.get("snapshot_date", ""),
                     result.get("count", 0),
                 )
+                refresh_state.finish(
+                    snapshot_date=result.get("snapshot_date", "") or "",
+                    count=int(result.get("count", 0) or 0),
+                )
         except Exception as e:
             logger.exception(f"[上下文维护] 机会自动刷新异常: {e}")
+            refresh_state.finish(error=str(e))
         finally:
             self._refreshing = False
 
@@ -300,25 +347,39 @@ class ContextMaintenanceScheduler:
         await self._refresh_opportunities_job()
 
     async def refresh_opportunities_once(self) -> dict:
-        """手动触发一次机会刷新。"""
-        with kline_source("refresh_opportunities"):
-            return await asyncio.to_thread(
-                refresh_strategy_signals,
-                rebuild_candidates=True,
-                max_inputs=500,
-                market_scan_limit=80,
-                max_kline_symbols=60,
-                limit_candidates=2000,
+        """手动触发一次机会刷新（遵守全局刷新锁）。"""
+        started, state = refresh_state.try_begin(source="manual")
+        if not started:
+            return {"queued": False, "running": True, "snapshot_date": "", "count": 0, "items": []}
+        try:
+            with kline_source("refresh_opportunities"):
+                result = await asyncio.to_thread(
+                    refresh_strategy_signals,
+                    rebuild_candidates=True,
+                    max_inputs=500,
+                    market_scan_limit=80,
+                    max_kline_symbols=60,
+                    limit_candidates=2000,
+                )
+            refresh_state.finish(
+                snapshot_date=(result or {}).get("snapshot_date", "") or "",
+                count=int((result or {}).get("count", 0) or 0),
             )
+            return result
+        except Exception as e:
+            refresh_state.finish(error=str(e))
+            raise
 
     async def cleanup_once(self) -> dict:
-        return await asyncio.to_thread(
+        deleted = await asyncio.to_thread(
             cleanup_context_data,
             snapshot_days=self.snapshot_retention_days,
             topic_days=self.snapshot_retention_days,
             context_run_days=self.snapshot_retention_days,
             outcome_days=self.outcome_retention_days,
         )
+        deleted["strategy"] = await asyncio.to_thread(cleanup_strategy_data)
+        return deleted
 
     async def _refresh_trading_calendar_job(self):
         """刷新本地近期窗口,不联网拉取历史日历。"""

@@ -42,8 +42,8 @@ SYSTEM_JOB_CATALOG: tuple[JobSpec, ...] = (
         "news_flow",
         "news_flow_ingest_after_hours",
         "新闻采集(盘后)",
-        "0 15-23,0-8 * * *",
-        description="15:00-次日08:00 每小时整点采集一次",
+        "*/15 15-23,0-8 * * *",
+        description="15:00-次日08:00 每15分钟采集一次；夜间/休市由阶段节流自动降频",
     ),
     JobSpec(
         "news_flow",

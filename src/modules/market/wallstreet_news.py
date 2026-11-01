@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -98,7 +99,8 @@ def normalize_wallstreet_article(raw: dict) -> dict | None:
     }
 
 
-def fetch_hot_article_ids(timeout: float = 10.0) -> list[int]:
+def fetch_hot_items(timeout: float = 10.0) -> list[dict]:
+    """热榜条目（id / title / display_time）；列表已带这三项，可先判重再决定抓不抓正文。"""
     try:
         response = httpx.get(HOT_API_URL, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
@@ -111,7 +113,7 @@ def fetch_hot_article_ids(timeout: float = 10.0) -> list[int]:
         return []
     data = (payload or {}).get("data") or {}
     seen: set[int] = set()
-    ids: list[int] = []
+    items: list[dict] = []
     for item in list(data.get("day_items") or []) + list(data.get("week_items") or []):
         if not isinstance(item, dict):
             continue
@@ -122,8 +124,18 @@ def fetch_hot_article_ids(timeout: float = 10.0) -> list[int]:
         if aid in seen:
             continue
         seen.add(aid)
-        ids.append(aid)
-    return ids
+        items.append(
+            {
+                "id": aid,
+                "title": str(item.get("title") or "").strip(),
+                "display_time": item.get("display_time") or 0,
+            }
+        )
+    return items
+
+
+def fetch_hot_article_ids(timeout: float = 10.0) -> list[int]:
+    return [item["id"] for item in fetch_hot_items(timeout=timeout)]
 
 
 def fetch_article(article_id: int, timeout: float = 10.0) -> dict:
@@ -164,22 +176,37 @@ def fetch_wallstreet_hot(
     limit: int = 10,
     delay: float = 0.5,
     skip_urls: set[str] | None = None,
+    precheck: Callable[[str, datetime | None], bool] | None = None,
     timeout: float = 10.0,
 ) -> list[dict]:
-    """拉取热门文章并规范化；已存在 URL 跳过详情请求。"""
+    """拉取热门文章并规范化。
+
+    热榜 ``period=all`` 里大量是几天前的旧文，列表本身已带 ``display_time`` /
+    ``title``：先在列表阶段按采集窗口和标题判重过滤，再抓正文，
+    避免「抓回来才被丢掉」（实测 6 次详情请求 0 条入库）。
+    """
     skip = skip_urls or set()
-    ids = fetch_hot_article_ids(timeout=timeout)[: max(int(limit or 1) * 2, 1)]
-    items: list[dict] = []
-    for index, aid in enumerate(ids):
-        if len(items) >= max(int(limit or 1), 1):
-            break
-        page_url = ARTICLE_PAGE.format(aid)
+    wanted = max(int(limit or 1), 1)
+    candidates: list[dict] = []
+    for meta in fetch_hot_items(timeout=timeout):
+        page_url = ARTICLE_PAGE.format(meta["id"])
         if page_url in skip:
             continue
-        raw = fetch_article(aid, timeout=timeout)
+        moment = _parse_ts(meta.get("display_time"))
+        if not is_within_ingest_window(moment):
+            continue
+        if precheck is not None and precheck(meta.get("title") or "", moment):
+            continue
+        candidates.append({**meta, "news_time": moment})
+        if len(candidates) >= wanted:
+            break
+
+    items: list[dict] = []
+    for index, meta in enumerate(candidates):
+        raw = fetch_article(meta["id"], timeout=timeout)
         item = normalize_wallstreet_article(raw)
         if item and is_within_ingest_window(item.get("news_time")):
             items.append(item)
-        if index + 1 < len(ids):
+        if index + 1 < len(candidates):
             time.sleep(max(float(delay or 0), 0))
     return items

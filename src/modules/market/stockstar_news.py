@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -223,10 +224,16 @@ def fetch_stockstar_feed(
     limit: int = 8,
     delay: float = 0.35,
     skip_urls: set[str] | None = None,
+    precheck: Callable[[str, datetime | None], bool] | None = None,
     timeout: float = 10.0,
 ) -> list[dict]:
-    """抓列表 → 跳过已入库 URL → 补正文 → 规范化。"""
+    """抓列表 → 跳过已入库 URL / 已知同事件标题 → 补正文 → 规范化。
+
+    列表页已带 title + 发布时间，``precheck`` 可在抓正文前用与入库相同的标题规则
+    判重：实测 6 篇正文里 5 篇是别家先收过的同一件事，白抓。
+    """
     skip = skip_urls or set()
+    wanted = max(int(limit or 1), 1)
     candidates: list[dict] = []
     seen: set[str] = set()
     for list_url in list_urls:
@@ -234,25 +241,30 @@ def fetch_stockstar_feed(
             url = row.get("url") or ""
             if not url or url in seen or url in skip:
                 continue
-            if not is_within_ingest_window(_parse_list_time(str(row.get("publish_date") or ""))):
+            moment = _parse_list_time(str(row.get("publish_date") or ""))
+            if not is_within_ingest_window(moment):
+                continue
+            if precheck is not None and precheck(row.get("title") or "", moment):
                 continue
             seen.add(url)
             candidates.append(row)
-            if len(candidates) >= max(int(limit or 1), 1) * 3:
+            if len(candidates) >= wanted * 3:
                 break
-        if len(candidates) >= max(int(limit or 1), 1) * 3:
+        if len(candidates) >= wanted * 3:
             break
 
     items: list[dict] = []
-    for index, row in enumerate(candidates):
-        if len(items) >= max(int(limit or 1), 1):
+    fetched = 0
+    for row in candidates:
+        if len(items) >= wanted:
             break
+        if fetched:
+            time.sleep(max(float(delay or 0), 0))
+        fetched += 1
         detail = fetch_article_content(row["url"], timeout=timeout)
         item = normalize_stockstar_item(row, detail, news_type=news_type)
         if item and is_within_ingest_window(item.get("news_time")):
             items.append(item)
-        if index + 1 < len(candidates):
-            time.sleep(max(float(delay or 0), 0))
     return items
 
 

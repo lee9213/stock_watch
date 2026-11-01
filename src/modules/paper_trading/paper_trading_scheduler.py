@@ -33,14 +33,19 @@ class PaperTradingScheduler:
         self.scheduler = AsyncIOScheduler(timezone=timezone)
         self.interval_seconds = max(15, int(interval_seconds))
         self._running = False
+        # 休市只在状态切换时提示一次,避免每分钟一条“跳过本轮”的心跳日志。
+        self._closed_notified = False
 
     async def _scan_job(self):
         if self._running:
             logger.debug("[模拟盘] 上轮扫描仍在执行，跳过本轮")
             return
         if not _any_market_trading():
-            logger.debug("[模拟盘] 全市场休市,跳过本轮扫描")
+            if not self._closed_notified:
+                self._closed_notified = True
+                logger.debug("[模拟盘] 全市场休市，暂停扫描（开盘后自动恢复）")
             return
+        self._closed_notified = False
         self._running = True
         try:
             with track_job_run(

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -39,6 +40,14 @@ from src.modules.market.ths_news import normalize_ths_item
 from src.platform.persistence.models import MarketNews, MarketNewsDiscard, NewsDigest
 
 SH = ZoneInfo("Asia/Shanghai")
+
+
+@pytest.fixture(autouse=True)
+def _no_cross_round_linger(monkeypatch):
+    """非交易时段会跨轮攒批 15-30 分钟，测试里一律关闭，避免用例挂住。"""
+    from src.modules.market import news_flow_scheduler as nfs
+
+    monkeypatch.setattr(nfs, "batch_linger_sec", lambda *a, **k: 0.0)
 
 
 def _db():
@@ -384,13 +393,13 @@ def test_analyze_queue_stores_news_ids_and_skips_when_full():
         sched._analyze_queue = asyncio.Queue(maxsize=3)
         calls: list[int] = []
 
-        async def fake_analyze(news_id, client=None):
-            calls.append(int(news_id))
+        async def fake_analyze(_client, news_ids, **_kwargs):
+            calls.extend(int(x) for x in news_ids)
             await asyncio.sleep(0.02)
-            return True
+            return [int(x) for x in news_ids]
 
         with patch(
-            "src.modules.market.news_flow_scheduler.analyze_by_id",
+            "src.modules.market.news_flow_scheduler.analyze_many",
             side_effect=fake_analyze,
         ):
             worker = asyncio.create_task(sched._analyze_worker(0))
@@ -641,6 +650,53 @@ def test_ingest_now_reports_busy_and_failure():
     asyncio.run(_run())
 
 
+def test_analyze_worker_throttles_repeated_client_failures(caplog):
+    """未配置模型时每个 id 都会失败，但同类告警只打一次，避免日志表写风暴。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from src.modules.market.news_flow_scheduler import NewsFlowScheduler
+
+    async def _run():
+        sched = NewsFlowScheduler()
+        analyzed: list[int] = []
+
+        async def fake_analyze(_client, news_ids, **_kwargs):
+            analyzed.extend(int(x) for x in news_ids)
+            raise RuntimeError("Missing credentials")
+
+        with patch(
+            "src.modules.market.news_flow_scheduler._load_analysis_client",
+            side_effect=RuntimeError("Missing credentials"),
+        ), patch(
+            "src.modules.market.news_flow_scheduler.analyze_many",
+            side_effect=fake_analyze,
+        ), patch(
+            "src.modules.market.news_flow_scheduler.track_job_run",
+            _stub_track_job_run(),
+        ):
+            worker = asyncio.create_task(sched._analyze_worker(0))
+            try:
+                sched._enqueue_news_ids([1, 2, 3], log_label="test")
+                await sched._analyze_queue.join()
+            finally:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+        # 队列照常消费，不被退避卡住
+        assert analyzed == [1, 2, 3]
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(_run())
+    client_warnings = [
+        record for record in caplog.records
+        if "模型客户端不可用" in record.getMessage()
+    ]
+    assert len(client_warnings) == 1
+
+
 def test_analyze_worker_reloads_client_until_model_configured():
     import asyncio
     from types import SimpleNamespace
@@ -658,21 +714,23 @@ def test_analyze_worker_reloads_client_until_model_configured():
             loads.append(1)
             return clients[min(len(loads) - 1, 1)]
 
-        async def fake_analyze(news_id, client=None):
+        async def fake_analyze(client, news_ids, **_kwargs):
             seen.append(getattr(client, "model", None))
-            return True
+            return [int(x) for x in news_ids]
 
         with patch(
             "src.modules.market.news_flow_scheduler._load_analysis_client",
             side_effect=fake_load,
         ), patch(
-            "src.modules.market.news_flow_scheduler.analyze_by_id",
+            "src.modules.market.news_flow_scheduler.analyze_many",
             side_effect=fake_analyze,
         ):
             worker = asyncio.create_task(sched._analyze_worker(0))
             try:
-                sched._enqueue_news_ids([1, 2, 3], log_label="test")
-                await sched._analyze_queue.join()
+                # 逐条入队并等消费完：每次迭代一个 id，验证「模型为空时下一条重取」
+                for news_id in (1, 2, 3):
+                    sched._enqueue_news_ids([news_id], log_label="test")
+                    await sched._analyze_queue.join()
             finally:
                 worker.cancel()
                 try:
@@ -923,8 +981,24 @@ def test_news_title_key_matches_ths_and_stockstar_formats():
     ths = news_title_key("佑驾创新与腾讯云达成战略合作。双方将在智能驾驶领域合作")
     star = news_title_key("佑驾创新与腾讯云达成战略合作。（原标题：佑驾创新与腾讯云达成战略合作） 人民财讯10月30日电")
     assert ths == star == "佑驾创新与腾讯云达成战略合作"
-    assert news_title_key("暴雷！新易盛三季度净利润增长") == ""
+    # 首句过短时累积后续句子：只返回空串会让这类标题党彻底退出跨来源判重
+    # （实测「利好来了！北京，重磅发布！事关氢能产业」同一事件被分析了两次）。
+    assert news_title_key("暴雷！新易盛三季度净利润增长") == "暴雷新易盛三季度净利润增长"
+    assert news_title_key("利好来了！北京，重磅发布！事关氢能产业。") == "利好来了北京重磅发布事关氢能产业"
+    # 全文都凑不出 8 字才真的没有键
+    assert news_title_key("暴雷") == ""
     assert news_title_key("A股开盘：三大指数集体低开。上证指数低开1.25%") == "A股开盘三大指数集体低开"
+
+
+def test_news_title_key_extends_short_lead_but_keeps_them_distinguishable():
+    """累积出的键要带上区分信息，避免把同城不同政策并成一条。"""
+    from src.platform.persistence.news_keys import news_title_key, titles_similar
+
+    hydrogen = news_title_key("利好来了！北京，重磅发布！事关氢能产业。（原标题：利好来了！北京，重磅发布！事关千亿产业）")
+    hydrogen2 = news_title_key("利好来了！北京，重磅发布！事关千亿产业。（原标题：利好来了！北京，重磅发布！事关千亿产业）")
+    space = news_title_key("利好来了！北京，重磅发布！事关商业航天。")
+    assert titles_similar(hydrogen, hydrogen2)
+    assert not titles_similar(hydrogen, space)
 
 
 def test_titles_similar_matches_real_duplicates_but_not_different_events():
@@ -994,17 +1068,41 @@ def test_insert_news_skips_cross_source_duplicate_title():
 
 def test_insert_news_keeps_daily_template_titles_a_day_apart():
     db = _db()
-    today = datetime(2026, 10, 30, 9, 30, tzinfo=SH)
-    assert insert_news(db, {
+    today = datetime.now(SH).replace(microsecond=0)
+    yesterday = insert_news(db, {
         "digest": "A股开盘：三大指数集体低开。上证指数低开1.25%",
         "news_time": today - timedelta(days=1),
         "news_md5": "3" * 32,
-    }) is not None
+    })
+    assert yesterday is not None
+    # 昨天那条是昨天收进来的：入库时间也要拨回去，否则会被当成「今天才转载的旧文」。
+    db.query(MarketNews).filter(MarketNews.id == yesterday.id).update(
+        {MarketNews.created_at: today - timedelta(days=1)}
+    )
+    db.commit()
     assert insert_news(db, {
         "digest": "A股开盘：三大指数集体低开。上证指数低开0.40%",
         "news_time": today,
         "news_md5": "4" * 32,
     }) is not None
+
+
+def test_insert_news_blocks_reprint_ingested_long_after_publication():
+    """转载：隔十几小时才被另一个来源收进来，发布时间差远超窗口但仍是同一件事。"""
+    db = _db()
+    now = datetime.now(SH).replace(microsecond=0)
+    assert insert_news(db, {
+        "digest": "利好来了！北京，重磅发布！事关千亿产业。（原标题：利好来了！北京，重磅发布！事关千亿产业）",
+        "news_time": now - timedelta(hours=1),
+        "news_md5": "1" * 32,
+    }) is not None
+    # 19 小时前发布的同一件事、刚被另一来源转载进来 → 判重
+    assert insert_news(db, {
+        "digest": "利好来了！北京，重磅发布！事关氢能产业。（原标题：利好来了！北京，重磅发布！事关千亿产业）",
+        "news_time": now - timedelta(hours=19),
+        "news_md5": "2" * 32,
+    }) is None
+    assert db.query(MarketNews).count() == 1
 
 
 def test_discarded_title_blocks_other_source_copy():

@@ -96,6 +96,9 @@ export interface StrategySignalItem {
   rank_score: number
   confidence?: number | null
   status: string
+  /** 能不能现在下单：active + buy/add + 有区间 + 计划达标 + 无新闻门槛。
+   *  status 只表示"信号多强"，前端"可执行/观察"切分要用这个字段。 */
+  actionable?: boolean
   action: string
   action_label: string
   signal: string

@@ -299,6 +299,8 @@ class MarketNews(Base):
     __table_args__ = (
         UniqueConstraint("news_md5", name="uq_market_news_md5"),
         Index("ix_market_news_time", "news_time"),
+        # 待分析积压统计与补扫都按 (analyzed=0, news_time 倒序) 取，避免全表扫。
+        Index("ix_market_news_pending", "analyzed", "news_time"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -627,6 +629,10 @@ class EntryCandidate(Base):
     evidence = Column(JSON, default=[])
     plan = Column(JSON, default={})
     meta = Column(JSON, default={})
+    # 每日首个"盘中轮次"的判定快照（status/action/entry/stop/target/score/phase）。
+    # 当天后续刷新只更新业务字段，不再覆盖 frozen，从而让后验评估拿到 point-in-time
+    # 状态，避免"收盘后知道结果再筛机会"的前视偏差。
+    frozen = Column(JSON, default={})
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -734,6 +740,7 @@ class StrategySignalRun(Base):
         Index("ix_strategy_signal_snapshot_rank", "snapshot_date", "rank_score"),
         Index("ix_strategy_signal_strategy_market", "strategy_code", "stock_market"),
         Index("ix_strategy_signal_status", "status", "updated_at"),
+        Index("ix_strategy_signal_snapshot_actionable", "snapshot_date", "actionable"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -752,6 +759,10 @@ class StrategySignalRun(Base):
     rank_score = Column(Float, nullable=False, default=0)
     confidence = Column(Float, nullable=True)
     status = Column(String, default="active")  # active/inactive/invalidated
+    # 可执行 = active + buy/add + 有入场区间 + 计划质量达标 + 无新闻门槛。
+    # 与 status 分开：status 表示"这个信号有多强"，actionable 表示"现在能不能下单"。
+    # rank_score 只是排序分，不再兼任"可执行"判据。
+    actionable = Column(Boolean, default=False)
     action = Column(String, default="watch")
     action_label = Column(String, default="观望")
     signal = Column(String, default="")
@@ -773,6 +784,8 @@ class StrategySignalRun(Base):
     is_holding_snapshot = Column(Boolean, default=False)
     context_quality_score = Column(Float, nullable=True)
     payload = Column(JSON, default={})
+    # 同 EntryCandidate.frozen：当日首个盘中轮次的最终可执行状态，评估以此为准。
+    frozen = Column(JSON, default={})
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

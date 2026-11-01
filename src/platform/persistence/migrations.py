@@ -2733,6 +2733,143 @@ def _m142_json_store_chinese(conn: Connection) -> None:
     logger.info("JSON 中文回写完成，合计 %s 行", total)
 
 
+def _m155_market_news_pending_index(conn: Connection) -> None:
+    """待分析积压统计/补扫走 (analyzed, news_time) 复合索引，避免全表扫。"""
+    if not _has_table(conn, "market_news"):
+        return
+    _create_index_if_missing(
+        conn,
+        "ix_market_news_pending",
+        "CREATE INDEX ix_market_news_pending ON market_news(analyzed, news_time)",
+    )
+
+
+def _m156_point_in_time_frozen(conn: Connection) -> None:
+    """机会链路的 point-in-time 冻结列 + 补位回扫索引。
+
+    - ``frozen``：记录当日首个"盘中轮次"的最终判定，评估只认这一份，
+      消除"当天 22:00 收盘后重刷覆盖同一个 snapshot_date"造成的前视偏差。
+    - ``ix_entry_candidate_symbol_date``：``_load_kline_fallbacks`` 按股票代码
+      IN + 快照日期回扫历史 K 线，此前缺索引只能全表扫。
+    """
+    _add_column_if_missing(
+        conn,
+        "entry_candidates",
+        "frozen",
+        "ALTER TABLE entry_candidates ADD COLUMN frozen TEXT DEFAULT '{}'",
+    )
+    _add_column_if_missing(
+        conn,
+        "strategy_signal_runs",
+        "frozen",
+        "ALTER TABLE strategy_signal_runs ADD COLUMN frozen TEXT DEFAULT '{}'",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_candidate_symbol_date",
+        "CREATE INDEX ix_entry_candidate_symbol_date "
+        "ON entry_candidates(stock_symbol, snapshot_date)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_signal_symbol_date",
+        "CREATE INDEX ix_strategy_signal_symbol_date "
+        "ON strategy_signal_runs(stock_symbol, snapshot_date)",
+    )
+
+
+def _m157_signal_actionable(conn: Connection) -> None:
+    """把"可执行"从 rank_score 里拆出来，作为独立布尔列。
+
+    改造前 ``active + buy`` 的行一律被当作"可执行"，但缺个股直接新闻的行会被
+    扣分封顶到 74（低于 75 的可执行门槛），于是页面"可执行 N 只"里混着 74 分的票，
+    而 ``rank_score >= 75`` 这个不变量同时被打破。现在：
+    ``actionable`` = status=active + buy/add + 有入场区间 + 计划质量达标 + 无新闻门槛，
+    统计、排序、前端徽标统一读它，rank_score 只表示排序分。
+    """
+    _add_column_if_missing(
+        conn,
+        "strategy_signal_runs",
+        "actionable",
+        "ALTER TABLE strategy_signal_runs ADD COLUMN actionable BOOLEAN DEFAULT 0",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_signal_snapshot_actionable",
+        "CREATE INDEX ix_strategy_signal_snapshot_actionable "
+        "ON strategy_signal_runs(snapshot_date, actionable)",
+    )
+    # 历史回填：没有 payload 可判新闻门槛，按 status/action/区间保守回填。
+    conn.execute(
+        text(
+            "UPDATE strategy_signal_runs SET actionable = 1 "
+            "WHERE status = 'active' AND action IN ('buy', 'add') "
+            "AND entry_low IS NOT NULL AND entry_high IS NOT NULL "
+            "AND COALESCE(plan_quality, 0) >= 90"
+        )
+    )
+
+
+def _m158_news_title_key_extend(conn: Connection) -> None:
+    """标题键改为「首句过短时累积后续句子」，并回填历史空键 + 清掉暴露出的副本。
+
+    原实现首句不足 8 字直接返回空串，「利好来了！北京，重磅发布！事关氢能产业」
+    这类标题因此完全不参与跨来源判重：实测同一事件（北京氢能方案）被两个来源
+    各分析了一次、页面上两条都在。回填后按「发布时间 / 入库时间」双窗口重排一次，
+    把已存在的副本清掉（保留最早入库的一条）。
+    """
+    if not _has_table(conn, "market_news") or not _has_column(conn, "market_news", "title_key"):
+        return
+    raw_expr = "raw_text" if _has_column(conn, "market_news", "raw_text") else "''"
+    created_expr = "created_at" if _has_column(conn, "market_news", "created_at") else "NULL"
+    rows = conn.execute(
+        text(
+            f"SELECT id, COALESCE(NULLIF({raw_expr}, ''), digest), news_time, {created_expr} "
+            "FROM market_news WHERE COALESCE(title_key, '') = '' ORDER BY id"
+        )
+    ).fetchall()
+    filled = 0
+    for row_id, source_text, _news_time, _created_at in rows:
+        key = news_title_key(source_text)
+        if not key:
+            continue
+        conn.execute(
+            text("UPDATE market_news SET title_key = :key WHERE id = :id"),
+            {"key": key, "id": row_id},
+        )
+        filled += 1
+    if filled:
+        logger.info("标题键回填：%s 条原本为空", filled)
+
+    rows = conn.execute(
+        text(
+            "SELECT id, title_key, news_time, created_at FROM market_news "
+            "WHERE COALESCE(title_key, '') <> '' ORDER BY id"
+        )
+    ).fetchall()
+    window = timedelta(hours=NEWS_DUPLICATE_WINDOW_HOURS)
+    kept: list[tuple[str, datetime, datetime]] = []
+    duplicate_ids: list[int] = []
+    for row_id, key, raw_time, raw_created in rows:
+        moment = _parse_sqlite_datetime(raw_time)
+        ingested = _parse_sqlite_datetime(raw_created) or moment
+        if moment is None:
+            continue
+        nearby = [
+            seen_key
+            for seen_key, seen_time, seen_ingested in kept
+            if abs(moment - seen_time) <= window or abs(ingested - seen_ingested) <= window
+        ]
+        if has_similar_title(key, nearby):
+            duplicate_ids.append(int(row_id))
+        else:
+            kept.append((key, moment, ingested))
+    for row_id in duplicate_ids:
+        conn.execute(text("DELETE FROM market_news WHERE id = :id"), {"id": row_id})
+    if duplicate_ids:
+        logger.info("标题键回填后去重：删除 %s 条后到副本", len(duplicate_ids))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -2788,6 +2925,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(152, "discard_weak_signal_news", _m152_discard_weak_signal_news),
     Migration(153, "news_title_dedupe", _m153_news_title_dedupe),
     Migration(154, "news_similar_title_dedupe", _m154_news_similar_title_dedupe),
+    Migration(155, "market_news_pending_index", _m155_market_news_pending_index),
+    Migration(156, "point_in_time_frozen", _m156_point_in_time_frozen),
+    Migration(157, "signal_actionable_flag", _m157_signal_actionable),
+    Migration(158, "news_title_key_extend", _m158_news_title_key_extend),
 )
 
 

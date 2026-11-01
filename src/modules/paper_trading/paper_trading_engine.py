@@ -546,6 +546,10 @@ def signal_passes_entry_gate(sig: StrategySignalRun) -> tuple[bool, str]:
     status = (sig.status or "").strip().lower()
     if status != "active":
         return False, "status_not_active"
+    payload = sig.payload if isinstance(sig.payload, dict) else {}
+    # 盘前轮次产出的"预演"信号只用于展示：它没有当日盘口确认，不能直接下单。
+    if bool(payload.get("preview")):
+        return False, "premarket_preview"
     action = (sig.action or "").strip().lower()
     if action not in ("buy", "add"):
         return False, "action_not_entry"
@@ -563,7 +567,6 @@ def signal_passes_entry_gate(sig: StrategySignalRun) -> tuple[bool, str]:
     if not REQUIRE_NEWS_CATALYST:
         return True, "ok"
 
-    payload = sig.payload if isinstance(sig.payload, dict) else {}
     news_metric = payload.get("news_metric") if isinstance(payload.get("news_metric"), dict) else {}
     if int(news_metric.get("direct_news_count") or 0) < 1:
         return False, "missing_news_catalyst"

@@ -40,15 +40,22 @@ class PriceAlertScheduler:
         try:
             result = await ENGINE.scan_once()
             triggered = result.get("triggered", 0)
-            # 实际触发了告警才是业务事件,否则只是心跳。
-            level = logging.INFO if triggered else logging.DEBUG
-            logger.log(
-                level,
-                "[价格提醒] 扫描完成: rules=%s triggered=%s skipped=%s",
-                result.get("total_rules", 0),
-                triggered,
-                result.get("skipped", 0),
-            )
+            total_rules = result.get("total_rules", 0)
+            # 只在有业务意义时落日志: 触发告警=INFO, 有规则但未触发=DEBUG,
+            # 一条规则都没有的纯心跳不再打印,否则每分钟一条把日志板刷满。
+            if triggered:
+                logger.info(
+                    "[价格提醒] 扫描完成: rules=%s triggered=%s skipped=%s",
+                    total_rules,
+                    triggered,
+                    result.get("skipped", 0),
+                )
+            elif total_rules:
+                logger.debug(
+                    "[价格提醒] 扫描完成: rules=%s triggered=0 skipped=%s",
+                    total_rules,
+                    result.get("skipped", 0),
+                )
         except Exception as e:
             logger.exception(f"[价格提醒] 扫描异常: {e}")
         finally:

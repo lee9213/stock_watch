@@ -11,11 +11,15 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 from statistics import fmean, stdev
 
+from sqlalchemy import or_
+
+from src.modules.strategy.scoring_config import POINT_IN_TIME_START
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import StrategyFactorSnapshot, StrategyOutcome
+from src.platform.scheduling.timezone import app_now
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,23 @@ FACTOR_FIELDS = (
     "crowd_penalty",  # 惩罚项,IC 预期为负
     "final_score",
 )
+
+
+def _point_in_time_filter():
+    """只纳入 point-in-time 干净的样本。
+
+    带前视偏差的样本(frozen 缺失、靠收盘后重算出的 active 状态回填)在"事后才
+    激活"的因子上天然表现更好,IC 会虚高;而因子 IC 又直接驱动 ``factor_calibration``
+    自动调权,等于闭环自我强化偏差。所以这里必须剔除。
+
+    上线日之前的快照没有 ``frozen`` 字段,属于历史数据,保留但由调用方按
+    ``point_in_time`` 字段识别口径不纯。
+    """
+    return or_(
+        StrategyFactorSnapshot.snapshot_date < POINT_IN_TIME_START,
+        StrategyOutcome.meta["point_in_time"].as_boolean() == True,  # noqa: E712
+    )
+
 
 
 def pearson(xs: list[float], ys: list[float]) -> float | None:
@@ -83,10 +104,13 @@ def evaluate_factor_ic(
     own = db is None
     db = db or SessionLocal()
     try:
-        cutoff = (date.today() - timedelta(days=max(7, int(days)))).strftime("%Y-%m-%d")
-        # 防泄漏(point-in-time):只纳入持有期已走完的样本
-        # (snapshot_date + horizon 日历日 <= today),杜绝偷看未实现收益。
-        horizon_cutoff = (date.today() - timedelta(days=int(horizon))).strftime("%Y-%m-%d")
+        today = app_now().date()
+        cutoff = (today - timedelta(days=max(7, int(days)))).strftime("%Y-%m-%d")
+        # 防泄漏(point-in-time):只纳入持有期已走完的样本。horizon 是**交易日**,
+        # 换算成日历日要留冗余(原实现直接用 horizon 个日历日，5 个交易日实际跨 7 天，
+        # 条件偏松)。这里按 7/5 折算再加 2 天缓冲。
+        horizon_days_cal = int(int(horizon) * 7 / 5) + 2
+        horizon_cutoff = (today - timedelta(days=horizon_days_cal)).strftime("%Y-%m-%d")
         query = (
             db.query(StrategyFactorSnapshot, StrategyOutcome.outcome_return_pct)
             .join(
@@ -100,6 +124,7 @@ def evaluate_factor_ic(
                 StrategyOutcome.outcome_return_pct.isnot(None),
                 StrategyFactorSnapshot.snapshot_date >= cutoff,
                 StrategyFactorSnapshot.snapshot_date <= horizon_cutoff,
+                _point_in_time_filter(),
             )
         )
         if market:
@@ -108,12 +133,19 @@ def evaluate_factor_ic(
 
         all_xy: dict[str, tuple[list[float], list[float]]] = {f: ([], []) for f in FACTOR_FIELDS}
         by_date: dict[str, dict[str, tuple[list[float], list[float]]]] = {}
+        # 有效样本量：同一只票同日可能挂多条策略行（因子值高度重复），
+        # 行数会让人误以为样本很足，这里额外统计去重票数供调用方判断置信度。
+        symbols: set[tuple[str, str]] = set()
+        pit_clean = 0
 
         for snap, ret in rows:
             try:
                 r = float(ret)
             except Exception:
                 continue
+            symbols.add(((snap.stock_market or "CN"), snap.stock_symbol or ""))
+            if bool((snap.snapshot_date or "") >= POINT_IN_TIME_START):
+                pit_clean += 1
             for f in FACTOR_FIELDS:
                 v = getattr(snap, f, None)
                 if v is None:
@@ -154,7 +186,17 @@ def evaluate_factor_ic(
                 "ic_periods": len(period_ics),
             }
 
-        return {"horizon": int(horizon), "days": int(days), "market": market, "factors": factors}
+        return {
+            "horizon": int(horizon),
+            "days": int(days),
+            "market": market,
+            "factors": factors,
+            # rows 是"信号行数"，同一只票挂多策略会重复计；unique_symbols 才是
+            # 有效横截面规模。IC 的置信度取决于后者。
+            "rows": len(rows),
+            "unique_symbols": len(symbols),
+            "point_in_time_samples": pit_clean,
+        }
     except Exception as e:
         logger.warning(f"[因子评估] IC 计算失败: {e}")
         return {"horizon": int(horizon), "days": int(days), "market": market,

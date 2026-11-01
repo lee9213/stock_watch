@@ -12,7 +12,7 @@ def test_package_vendors_by_type_content():
     """内容必须与 client.py 现状(quote/kline/capital_flow/events 各 vendor)完全一致。"""
     assert PACKAGE_VENDORS_BY_TYPE == {
         "quote": frozenset({"tencent", "sina", "eastmoney", "ths", "yfinance"}),
-        "kline": frozenset({"tencent", "stooq", "eastmoney", "ths", "yahoo"}),
+        "kline": frozenset({"tencent", "stooq", "eastmoney", "ths", "yahoo", "baidu"}),
         "capital_flow": frozenset({"eastmoney", "sina"}),
         "events": frozenset({"eastmoney"}),
         "flash_news": frozenset({"cls", "sina", "eastmoney", "ths"}),

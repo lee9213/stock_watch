@@ -48,7 +48,15 @@ def test_calibrate_all_markets_closes_loop_into_scoring():
         db.commit()
 
         res = calibrate_all_markets(db=db, min_samples=5)
-        assert set(res) == {"CN", "HK", "US"}
+        # 机会链路只产 A 股信号，默认只标定 CN。改造前遍历 CN/HK/US，
+        # 港股/美股永远 0 样本，每轮都"成功"返回 changed=0 并写 last_calibrated_at，
+        # 运维看到的是"已标定"，实际是空跑。
+        assert set(res) == {"CN"}
+        # 需要时仍可显式指定市场（未来开放港股/美股机会页时）。
+        assert set(calibrate_all_markets(db=db, min_samples=5, markets=["CN", "HK"])) == {
+            "CN",
+            "HK",
+        }
 
         w = get_factor_weights("CN", db=db)
         assert w["alpha_score"] > 1.0  # IC 闭环把权重抬高

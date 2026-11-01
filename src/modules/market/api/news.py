@@ -239,6 +239,17 @@ async def ingest_news_flow_now():
     return result
 
 
+@router.get("/flow/status")
+def get_news_flow_status():
+    """事件驱动运行状态：队列积压 / 待分析存量 / worker 数。"""
+    from src.modules.market.news_flow_scheduler import get_active_scheduler
+
+    sched = get_active_scheduler()
+    if sched is None:
+        return {"running": False}
+    return {"running": True, **sched.stats()}
+
+
 @router.get("/flow")
 def get_news_flow(
     keyword: str = Query("", description="在摘要中匹配话题词；空或「全部新闻」不过滤"),

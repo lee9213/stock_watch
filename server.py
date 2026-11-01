@@ -19,7 +19,13 @@ from src.platform.persistence.models import (
     AppSettings,
     DataSource,
 )
-from src.platform.observability.log_handler import DBLogHandler
+from src.platform.observability.log_handler import (
+    AccessLogFilter,
+    DBLogHandler,
+    NoiseFilter,
+    RepeatFilter,
+    silence_noisy_loggers,
+)
 from src.platform.runtime.config import Settings, AppConfig, StockConfig
 from src.platform.runtime.paths import get_data_dir
 from src.platform.marketdata.models import MarketCode
@@ -144,9 +150,12 @@ def setup_logging():
     """配置日志: 控制台 + 数据库
 
     分级策略:
-    - root logger 始终 DEBUG,所有日志都会传播到 handler
-    - 控制台 handler 按 LOG_LEVEL 过滤(默认 INFO),并丢弃 httpx 等三方库的 < WARNING 噪音
-    - DB handler 始终 DEBUG 全量收录,UI 日志板永远可以看到包括心跳/httpx 请求在内的完整记录
+    - 三方库(httpx/httpcore/apscheduler/openai 等)的逐请求日志在源头即被压到
+      WARNING,既不进控制台也不写库——这类日志实测占总量 95% 以上,且会把
+      SQLite 写入挤到 locked/readonly。设 ``LOG_THIRD_PARTY_LEVEL=DEBUG`` 可还原。
+    - root logger 始终 DEBUG,业务代码的 DEBUG 日志照常进控制台(受 LOG_LEVEL)
+      与数据库(UI 日志板可查)。
+    - uvicorn access log 只保留 4xx/5xx,正常请求不写库。
     """
     console_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
     console_level = getattr(logging, console_level_name, logging.INFO)
@@ -154,6 +163,7 @@ def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     install_log_record_factory()
+    silence_noisy_loggers()
 
     # reload/server restart 时避免重复 handler 导致日志放大。
     for h in list(root.handlers):
@@ -164,11 +174,13 @@ def setup_logging():
             except Exception:
                 pass
 
-    # 控制台输出: 按 LOG_LEVEL 过滤,且丢弃三方库的低级别噪音
+    # 控制台输出: 按 LOG_LEVEL 过滤
     console = logging.StreamHandler()
     console._panwatch_console = True  # type: ignore[attr-defined]
     console.setLevel(console_level)
-    console.addFilter(_ConsoleNoiseFilter())
+    console.addFilter(NoiseFilter())
+    console.addFilter(AccessLogFilter())
+    console.addFilter(RepeatFilter())
     console.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"
@@ -176,38 +188,19 @@ def setup_logging():
     )
     root.addHandler(console)
 
-    # 数据库持久化: 始终全量收录,UI 日志板可查 DEBUG
+    # 数据库持久化: 业务日志全量收录(含 DEBUG),三方库噪音由 handler 过滤器拦掉。
     db_handler = DBLogHandler(level=logging.DEBUG)
     db_handler.setFormatter(logging.Formatter("%(message)s"))
     root.addHandler(db_handler)
 
     # uvicorn 默认给自己挂了 stderr handler 并且 propagate=False,导致 access log
     # 走自己的链路(`INFO: 127.0.0.1 - "GET /api/..."`)不被我们的 filter 拦截。
-    # 改成清空自己的 handler + propagate 到 root,让 _ConsoleNoiseFilter 生效。
+    # 改成清空自己的 handler + propagate 到 root,让过滤器生效。
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(name)
         lg.handlers = []
         lg.propagate = True
         lg.setLevel(logging.DEBUG)
-
-
-class _ConsoleNoiseFilter(logging.Filter):
-    """控制台 handler 过滤器: 三方库的 INFO/DEBUG 不进 stdout,WARNING+ 仍然显示。
-    DB handler 不挂这个过滤器,UI 日志板能看到完整请求记录。
-
-    uvicorn.access 是每条请求的 access log(`INFO: 127.0.0.1 - "GET /api/..." 200 OK`),
-    属于底层心跳;uvicorn / uvicorn.error 是应用级日志(启动、报错),保留。"""
-
-    _NOISY_PREFIXES = ("httpx", "httpcore", "urllib3", "apscheduler", "uvicorn.access")
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno >= logging.WARNING:
-            return True
-        name = record.name or ""
-        for prefix in self._NOISY_PREFIXES:
-            if name == prefix or name.startswith(prefix + "."):
-                return False
-        return True
 
 
 def setup_playwright():
@@ -417,6 +410,19 @@ DATA_SOURCE_SEEDS: list[dict] = [
             },
             "enabled": False,  # 需代理,默认关(同 YFinance 口径),用户配好 proxy 再开
             "priority": 20,  # US/HK 最后兜底
+            "supports_batch": False,
+            "test_symbols": list(DEFAULT_TEST_SYMBOLS),
+        },
+        {
+            "name": "百度K线",
+            "type": "kline",
+            "provider": "baidu",
+            "config": {
+                "description": "百度股市通日线(A股/港股/美股,免 key)。固定近 100 交易日,"
+                "作腾讯/东财/同花顺全部失败后的兜底;实时行情/分时接口受百度 ACS 风控,未接入。",
+            },
+            "enabled": True,
+            "priority": 25,  # 全部主力源之后的兜底:只补“有数据但都拿不到”的场景
             "supports_batch": False,
             "test_symbols": list(DEFAULT_TEST_SYMBOLS),
         },

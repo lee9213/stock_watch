@@ -23,6 +23,7 @@
 ## 补票排序参考
 
 $prompt_155th
+$policy_focus
 
 ## 输出格式
 

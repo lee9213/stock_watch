@@ -71,7 +71,12 @@ const DEFAULT_FILTERS = {
   strategy: 'all',
   risk: 'all' as const,
   minScore: '70',
+  // 视图：可执行（能下单）/ 观察（active 但缺条件）/ 全部。
+  // 改造前只能看 active，页面顶部却显示全量"观察 N 只"，那些票点不开。
+  view: 'actionable' as ViewFilter,
 }
+
+type ViewFilter = 'actionable' | 'watching' | 'all'
 
 const toneClass = (item: StrategySignalItem) => {
   const action = (item.action || '').toLowerCase()
@@ -183,6 +188,11 @@ const toSignalFromCandidate = (row: EntryCandidateItem): StrategySignalItem => {
     constrained: false,
     constraint_reasons: [],
     payload: {
+      // 这条是候选快照兜底出来的"伪信号"：score 是候选绝对分（0-100），
+      // 不是策略层的横截面百分位（75-100），也没有 AI 打分与因子拆解。
+      score_scope: 'candidate',
+      ai_scored: false,
+      degraded_from: 'entry_candidate',
       source_meta: {
         plan: row.plan || {},
       },
@@ -224,7 +234,10 @@ export default function OpportunitiesPage() {
   const [strategy, setStrategy] = useLocalStorage('panwatch_opportunities_strategy_v3', DEFAULT_FILTERS.strategy)
   const [risk, setRisk] = useLocalStorage<RiskFilter>('panwatch_opportunities_risk_v3', DEFAULT_FILTERS.risk)
   const [minScore, setMinScore] = useLocalStorage('panwatch_opportunities_min_score_v3', DEFAULT_FILTERS.minScore)
+  const [view, setView] = useLocalStorage<ViewFilter>('panwatch_opportunities_view_v1', DEFAULT_FILTERS.view)
   const [snapshotDate, setSnapshotDate] = useState('')
+  // 后端 limit 截断时给用户一个明确提示，而不是静默只显示前 N 条。
+  const [truncated, setTruncated] = useState(false)
 
   const [insightOpen, setInsightOpen] = useState(false)
   const [insightSymbol, setInsightSymbol] = useState('')
@@ -275,22 +288,31 @@ export default function OpportunitiesPage() {
     setLoading(true)
     setError('')
     try {
+      const pageSize = 200
       const req = {
-        status: 'active' as const,
+        // 取 active + inactive 全量，前端按 "可执行 / 观察" 切视图：
+        // 只传 active 的话观察票永远看不到。
+        status: 'all' as const,
         source_pool: source,
         holding,
         market: market === 'ALL' ? '' : market,
         strategy_code: strategy === 'all' ? '' : strategy,
         risk_level: risk,
-        min_score: Number(minScore) || 0,
-        limit: 120,
+        // 分数门槛只对"可执行"视图生效。观察/全部视图若继续套用默认 70 分，
+        // 名为"全部"实际只是"≥70 分"，低分观察票永远看不到。
+        min_score: view === 'actionable' ? Number(minScore) || 0 : 0,
+        limit: pageSize,
         include_payload: false,
       }
       let data: Awaited<ReturnType<typeof recommendationsApi.listStrategySignals>>
+      // 降到候选快照时没有 actionable 语义，不做视图过滤，否则"可执行"视图会全空。
+      let degraded = false
       try {
+        // 降级链总预算控制在 40s 内：原先 45s + 90s + 90s 最长要等 3 分钟，
+        // 期间只有 loading，用户只会以为页面卡死。
         data = await recommendationsApi.listStrategySignals({
           ...req,
-          timeoutMs: 45000,
+          timeoutMs: 20000,
         })
       } catch (firstErr) {
         const msg = firstErr instanceof Error ? firstErr.message : ''
@@ -299,7 +321,7 @@ export default function OpportunitiesPage() {
           // Retry once for transient DB lock/contention.
           data = await recommendationsApi.listStrategySignals({
             ...req,
-            timeoutMs: 90000,
+            timeoutMs: 20000,
           })
         } catch (secondErr) {
           const secondMsg = secondErr instanceof Error ? secondErr.message : ''
@@ -312,7 +334,7 @@ export default function OpportunitiesPage() {
             snapshot_date: '',
             source: source === 'all' ? 'all' : source,
             holding: req.holding,
-            timeoutMs: 90000,
+            timeoutMs: 20000,
           })
           data = {
             snapshot_date: fallback.snapshot_date || '',
@@ -320,20 +342,29 @@ export default function OpportunitiesPage() {
             items: (fallback.items || []).map(toSignalFromCandidate),
           }
           setError(oppT('opportunities.errors.timeout'))
+          degraded = true
         }
       }
       if ((!data.items || data.items.length === 0) && market !== 'ALL') {
         const fallback = await recommendationsApi.listStrategySignals({
           ...req,
           market: '',
-          timeoutMs: 45000,
+          timeoutMs: 20000,
         })
         if (fallback.items && fallback.items.length > 0) {
           setError(oppT('opportunities.errors.noMarket', { market: oppT(`opportunities.markets.${market}`) }))
           data = fallback
         }
       }
-      setItems(data.items || [])
+      const raw = data.items || []
+      // 可执行 / 观察按后端 actionable 切分：status=active 只说明"信号强"，
+      // 缺新闻门槛、计划不达标、盘前预演都属于不可下单。
+      const filtered =
+        degraded || view === 'all'
+          ? raw
+          : raw.filter((it) => (view === 'actionable' ? !!it.actionable : !it.actionable))
+      setItems(filtered)
+      setTruncated(raw.length >= pageSize)
       setSnapshotDate(data.snapshot_date || '')
       if (!data.snapshot_date) {
         setError(oppT('opportunities.errors.noSnapshot'))
@@ -341,10 +372,11 @@ export default function OpportunitiesPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : oppT('opportunities.errors.loadFailed'))
       setItems([])
+      setTruncated(false)
     } finally {
       setLoading(false)
     }
-  }, [holding, market, minScore, risk, source, strategy])
+  }, [holding, market, minScore, risk, source, strategy, view])
 
   useEffect(() => {
     load()
@@ -614,6 +646,14 @@ export default function OpportunitiesPage() {
 
       <div data-tour="opportunity-filters" className="card p-3 md:p-4 mb-4">
         <div className="grid grid-cols-2 md:grid-cols-8 gap-2">
+          <Select value={view} onValueChange={(v) => setView(v as ViewFilter)}>
+            <SelectTrigger className="h-8 text-[12px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="actionable">{oppT('opportunities.views.actionable')}</SelectItem>
+              <SelectItem value="watching">{oppT('opportunities.views.watching')}</SelectItem>
+              <SelectItem value="all">{oppT('opportunities.views.all')}</SelectItem>
+            </SelectContent>
+          </Select>
           <Select value={market === 'ALL' || market === 'CN' ? market : 'CN'} onValueChange={(v) => setMarket(v as 'ALL' | 'CN')}>
             <SelectTrigger className="h-8 text-[12px]"><SelectValue /></SelectTrigger>
             <SelectContent>
@@ -683,6 +723,13 @@ export default function OpportunitiesPage() {
         </div>
       )}
 
+      {truncated && !loading && (
+        <div className="card p-3 mb-4 text-[12px] text-muted-foreground flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4" />
+          {oppT('opportunities.truncatedHint')}
+        </div>
+      )}
+
       <div data-tour="opportunity-signals" className="grid min-h-12 grid-cols-1 md:grid-cols-2 gap-3">
         {groupedItems.map((group) => {
           const item = group.primary
@@ -728,6 +775,11 @@ export default function OpportunitiesPage() {
                     </div>
                     <div className={`text-[12px] font-mono mt-1 ${Number(item.rank_score || item.score || 0) >= 80 ? 'text-primary' : 'text-muted-foreground'}`}>
                       {oppT('opportunities.score')} {Math.round(item.rank_score || item.score || 0)}
+                      {payload.score_scope === 'candidate' && (
+                        <span className="ml-1 text-[10px] text-amber-500 font-sans align-middle">
+                          {oppT('opportunities.candidateScore')}
+                        </span>
+                      )}
                     </div>
                     {item.ai_score != null && (
                       <div className="mt-1 flex items-center justify-end gap-1">

@@ -6,13 +6,86 @@ import src.modules.strategy.entry_candidates as ec
 
 
 def test_plan_quality_full_valid_plan():
+    # 风险基准是区间上沿（最差成交价）10.1：目标 11.2、止损 9.4
+    # → risk=0.7、reward=1.1、R:R≈1.57，满足 1.5 门槛才算满分。
     plan = {
         "entry_low": 9.9,
         "entry_high": 10.1,
         "stop_loss": 9.4,
-        "target_price": 10.8,
+        "target_price": 11.2,
         "invalidation": "若跌破 9.40 则失效",
     }
+    assert ec._plan_quality(plan, quote={"current_price": 10.0}) == 100
+
+
+def test_plan_quality_uses_worst_fill_not_mid():
+    """mid 口径达标、最差成交价口径不达标时必须否掉。
+
+    回踩买入时高开回落最先在 entry_high 成交，用区间中点当成本会低估风险。
+    这组数字 mid 口径 R:R=1.67 看似达标，entry_high 口径只有 1.29。
+    """
+    plan = {
+        "entry_low": 9.9,
+        "entry_high": 10.1,
+        "stop_loss": 9.4,
+        "target_price": 11.0,
+        "invalidation": "若跌破 9.40 则失效",
+    }
+    mid = (plan["entry_low"] + plan["entry_high"]) / 2
+    assert (plan["target_price"] - mid) / (mid - plan["stop_loss"]) > 1.5
+    assert ec._plan_quality(plan, quote={"current_price": 10.0}) <= 89
+
+
+def test_plan_quality_caps_when_risk_reward_too_low():
+    """字段齐全但"赚 0.5% 赔 6%"：改造前拿 100 分进 active，回测胜率因此虚高。"""
+    plan = {
+        "entry_low": 9.9,
+        "entry_high": 10.1,
+        "stop_loss": 9.4,
+        "target_price": 10.1,
+        "invalidation": "x",
+    }
+    assert ec._plan_quality(plan, quote={"current_price": 10.0}) <= 89
+
+
+def test_build_plan_band_follows_volatility():
+    """区间宽度应跟随 ATR：高波动票比低波动票拿到更宽的带。"""
+    quote = {"current_price": 10.0, "change_pct": 2.0, "turnover": 2e8}
+    calm = ec._build_plan(action="buy", quote=quote, kline={"atr": 0.08, "support": 9.8, "resistance": 10.3})
+    wild = ec._build_plan(action="buy", quote=quote, kline={"atr": 0.45, "support": 9.8, "resistance": 10.3})
+    calm_width = (calm["entry_high"] - calm["entry_low"]) / calm["entry_low"]
+    wild_width = (wild["entry_high"] - wild["entry_low"]) / wild["entry_low"]
+    assert wild_width > calm_width
+
+
+def test_build_plan_degrades_when_upside_insufficient():
+    """上方空间不足时降级，而不是把目标抬到阻力之上。
+
+    旧实现 `target = max(结构目标, mid + 1.5×risk)` 会用抬高目标的方式凑 R:R，
+    实测产出过"目标 +12% / 止损 -8% / R:R 恰好 1.50"的计划——三个数字全是常量边界，
+    目标成了公式产物，与真实阻力无关（曾把目标抬到阻力之上 6.4%）。
+    """
+    plan = ec._build_plan(
+        action="buy",
+        quote={"current_price": 10.0, "change_pct": 2.0, "turnover": 2e8},
+        kline={"atr": 0.05, "support": 9.0, "resistance": 10.05},
+    )
+    assert plan["plan_rr_ok"] is False
+    assert ec._plan_quality(plan, quote={"current_price": 10.0}) <= 89
+    # 目标不得为凑 R:R 越过阻力太多
+    assert plan["target_price"] <= 10.05 * 1.02
+    assert "风险回报比不达标" in plan["invalidation"]
+
+
+def test_build_plan_risk_reward_measured_on_worst_fill():
+    """结构空间足够时，按最差成交价（entry_high）算的 R:R 也要过门槛。"""
+    plan = ec._build_plan(
+        action="buy",
+        quote={"current_price": 10.0, "change_pct": 2.0, "turnover": 2e8},
+        kline={"atr": 0.2, "support": 9.8, "resistance": 10.6},
+    )
+    assert plan["plan_rr_ok"] is True
+    assert plan["risk_reward"] >= 1.5
     assert ec._plan_quality(plan, quote={"current_price": 10.0}) == 100
 
 

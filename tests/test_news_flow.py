@@ -603,7 +603,7 @@ def test_ingest_now_enqueues_then_enforces_cooldown():
 
     async def _run():
         sched = NewsFlowScheduler()
-        fake_result = {"ths": 2, "wallstreet": 0, "stock_star": 0, "created_ids": [101, 102]}
+        fake_result = {"sources": {"cls": 2}, "enabled": ["cls"], "created_ids": [101, 102]}
         with patch(
             "src.modules.market.news_flow_scheduler.ingest_news_sources",
             return_value=fake_result,

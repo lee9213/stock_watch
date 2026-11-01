@@ -98,6 +98,22 @@ def _item_text(item: dict) -> str:
     return " ".join(parts).lower()
 
 
+def has_market_signal(item: dict | None) -> bool:
+    """True=落得到 A 股：来源已挂股票，或正文命中市场词。
+
+    比 ``should_ingest_news`` 严格一档：后者对「既不噪音也不含市场词」的宏观快讯
+    是默认放行的（老源数量少，放行的代价可控）；快讯源一轮几十条，宏观占比过半，
+    默认放行会让 LLM 分析量翻数倍且绝大多数结果被判无用丢弃。所以快讯源用这个
+    更严的口径做闸门（见 ``news_sources.NewsSourceSpec.collect`` 的 market_only）。
+    """
+    if not isinstance(item, dict):
+        return False
+    if merge_stocks(item.get("relations_stocks")):
+        return True
+    text = _item_text(item)
+    return any(token.lower() in text for token in MARKET_TOKENS)
+
+
 def should_ingest_news(item: dict | None) -> bool:
     """True=入库。来源已挂股票或含市场词则留；仅噪音且无市场信号则丢。不确定则留。"""
     if not isinstance(item, dict):

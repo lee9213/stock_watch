@@ -522,7 +522,7 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "name": "财联社快讯",
             "type": "flash_news",
             "provider": "cls",
-            "config": {"description": "财联社 7×24 电报(免 key,本地签名)。"},
+            "config": {"description": "财联社 7×24 电报(免 key,本地签名)。仅用于快讯接口连通性测试,不参与事件驱动采集。"},
             "enabled": True,
             "priority": 0,
             "supports_batch": False,
@@ -532,7 +532,7 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "name": "新浪7x24快讯",
             "type": "flash_news",
             "provider": "sina",
-            "config": {"description": "新浪财经 7×24 直播,带关联个股。"},
+            "config": {"description": "新浪财经 7×24 直播,带关联个股。仅用于快讯接口连通性测试,不参与事件驱动采集。"},
             "enabled": True,
             "priority": 5,
             "supports_batch": False,
@@ -542,7 +542,7 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "name": "东方财富7x24快讯",
             "type": "flash_news",
             "provider": "eastmoney",
-            "config": {"description": "东财 np-weblist 7×24 资讯,与财联社互备。"},
+            "config": {"description": "东财 np-weblist 7×24 资讯,与财联社互备。仅用于快讯接口连通性测试,不参与事件驱动采集。"},
             "enabled": True,
             "priority": 10,
             "supports_batch": False,
@@ -554,10 +554,85 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "provider": "ths",
             "config": {
                 "description": "同花顺 tapp/news/push/stock 7×24 快讯(免 key),"
-                "与事件驱动新闻流同源;作财联社/新浪/东财之后的备源。"
+                "与事件驱动新闻流同源;仅用于快讯接口连通性测试,不参与事件驱动采集。"
             },
             "enabled": True,
             "priority": 15,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        # 事件驱动新闻源(type=event_news):这里的开关与顺序直接决定「事件驱动」
+        # 页面的采集范围。上面的 flash_news 只做快讯接口连通性测试,不参与入库。
+        # priority 越小越先入库 —— 同一事件被多源同时报到时先入库的那条留下,
+        # 所以排最前的源等于「默认代表来源」。
+        {
+            "name": "财联社电报",
+            "type": "event_news",
+            "provider": "cls",
+            "config": {
+                "description": "秒级电报,A 股首发最快;本地签名、免 key。不带个股标注。",
+                "limit": 50,
+                "market_only": True,
+            },
+            "enabled": True,
+            "priority": 0,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        {
+            "name": "东方财富快讯",
+            "type": "event_news",
+            "provider": "eastmoney",
+            "config": {
+                "description": "东财 7×24 快讯,个股公告与宏观都覆盖。不带个股标注。",
+                "limit": 50,
+                "market_only": True,
+            },
+            "enabled": True,
+            "priority": 5,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        {
+            "name": "新浪财经7x24",
+            "type": "event_news",
+            "provider": "sina",
+            "config": {
+                "description": "新浪 7×24 直播,部分条目自带关联个股(ext.stocks)。宏观占比最高。",
+                "limit": 50,
+                "market_only": True,
+            },
+            "enabled": True,
+            "priority": 10,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        {
+            "name": "同花顺快讯",
+            "type": "event_news",
+            "provider": "ths",
+            "config": {
+                "description": "同花顺股票快讯,唯一稳定带个股代码的源;会抓详情页补全文。",
+                "pages": 1,
+                "pagesize": 50,
+            },
+            "enabled": True,
+            "priority": 15,
+            "supports_batch": False,
+            "test_symbols": [],
+        },
+        {
+            "name": "证券之星",
+            "type": "event_news",
+            "provider": "stock_star",
+            "config": {
+                "description": "证券之星资讯/研报列表,会抓详情页;列表页常回填旧文,时效偏慢。",
+                "news_limit": 40,
+                "report_limit": 10,
+                "include_roll": False,
+            },
+            "enabled": True,
+            "priority": 20,
             "supports_batch": False,
             "test_symbols": [],
         },
@@ -1741,9 +1816,20 @@ if os.path.exists(static_dir):
     @app.get("/{path:path}")
     async def serve_spa(path: str):
         file_path = os.path.join(static_dir, path)
-        if os.path.isfile(file_path):
+        if path and os.path.isfile(file_path):
             return FileResponse(file_path)
-        return FileResponse(os.path.join(static_dir, "index.html"))
+        # 带扩展名的资源缺失时返回 404,不要回落到 index.html:
+        # 否则浏览器会把 HTML 当 JS/CSS 解析,前端直接白屏且难定位
+        # (前端重新构建后 hash 变化,旧页面引用的旧 chunk 就属于这种情况)
+        if path and "." in os.path.basename(path):
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Not Found")
+        # index.html 必须每次回源校验,否则重新构建后浏览器仍用旧入口,页面看起来"没更新"
+        return FileResponse(
+            os.path.join(static_dir, "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     logger.info(f"静态文件服务已启用: {static_dir}")
 

@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.modules.market.news_analysis import (
     BATCH_ANALYZE_SIZE,
@@ -22,6 +21,7 @@ from src.modules.market.news_analysis import (
 from src.modules.market.news_digest_job import job_news_digest_hourly
 from src.modules.market.news_ingest import ingest_news_sources
 from src.modules.market.news_signal_alert import push_if_strong
+from src.modules.market.news_sources import source_summary
 from src.modules.market.news_store import (
     REFRESH_HOUR_END,
     REFRESH_HOUR_START,
@@ -487,7 +487,7 @@ class NewsFlowScheduler:
             return None
         self._ingesting = True
         created_ids: list[int] = []
-        counts = {"ths": 0, "wallstreet": 0, "stock_star": 0}
+        counts: dict[str, int] = {}
         failed = False
         try:
             with track_job_run(
@@ -496,37 +496,26 @@ class NewsFlowScheduler:
                 trigger_source=trigger_source,
                 persist_idle=False,
             ) as summary:
-                # 三源抓取是同步网络 IO，放线程里跑，避免卡住事件循环。
-                # 同花顺第 2 页实测恒为空，抓 1 页即可。
-                result = await asyncio.to_thread(
-                    ingest_news_sources,
-                    ths_pages=1,
-                    ths_pagesize=50,
-                    wallstreet_limit=8,
-                    stockstar_news_limit=6,
-                    stockstar_report_limit=4,
-                    include_stockstar_roll=False,
-                ) or {}
+                # 采集是同步网络 IO，放线程里跑，避免卡住事件循环。
+                # 采哪些源、什么顺序、每源抓多少条，全部由数据源配置决定。
+                result = await asyncio.to_thread(ingest_news_sources) or {}
                 created_ids = [
                     int(x) for x in (result.get("created_ids") or []) if x is not None
                 ]
                 counts = {
-                    "ths": int(result.get("ths") or 0),
-                    "wallstreet": int(result.get("wallstreet") or 0),
-                    "stock_star": int(result.get("stock_star") or 0),
+                    str(key): int(value or 0)
+                    for key, value in (result.get("sources") or {}).items()
                 }
-                summary.update(counts)
+                summary["sources"] = counts
                 summary["created"] = len(created_ids)
                 total = sum(counts.values())
                 if total <= 0:
                     summary["_idle"] = True
                 else:
                     logger.info(
-                        "事件驱动采集：入库 %s（ths=%s wallstreet=%s stock_star=%s）",
+                        "事件驱动采集：入库 %s（%s）",
                         total,
-                        counts["ths"],
-                        counts["wallstreet"],
-                        counts["stock_star"],
+                        " ".join(f"{key}={value}" for key, value in counts.items()),
                     )
         except Exception:
             failed = True
@@ -584,8 +573,10 @@ class NewsFlowScheduler:
         db = SessionLocal()
         try:
             pending = count_pending_analysis(db)
+            sources = source_summary(db)
         except Exception:
             pending = -1
+            sources = []
         finally:
             db.close()
         phase = market_phase()
@@ -602,6 +593,7 @@ class NewsFlowScheduler:
             "digesting": self._digesting,
             "market_phase": phase,
             "ingest_min_interval_sec": ingest_min_interval_sec(phase),
+            "news_sources": sources,
         }
 
     def start(self) -> None:
@@ -647,8 +639,8 @@ class NewsFlowScheduler:
             max_instances=1,
         )
         self.scheduler.start()
-        from src.platform.scheduling.scheduler_registry import register
         from src.platform.scheduling.job_manager import apply_configs_to_scheduler
+        from src.platform.scheduling.scheduler_registry import register
         register("news_flow", self.scheduler)
         apply_configs_to_scheduler("news_flow", self.scheduler, timezone=self.scheduler.timezone)
         global _active_scheduler

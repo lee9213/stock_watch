@@ -466,7 +466,8 @@ def _news_row(*, item: dict, digest: str, digest_hash: str, url: str, news_time:
     relation_level = item.get("relation_level")
     return MarketNews(
         digest=digest,
-        raw_text=digest,
+        # 快讯源没有独立详情页，raw_text 直接等于正文；抓详情页的源可不传。
+        raw_text=item.get("raw_text") or digest,
         title_key=news_title_key(digest),
         tags=attach_topic_tags(digest, item.get("tags") or [], stocks),
         relation_level=int(relation_level if relation_level is not None else (3 if stocks else 0)),

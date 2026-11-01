@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from src.modules.market import news_flow_scheduler, news_ingest, news_store
+from src.modules.market import news_flow_scheduler, news_store
 from src.modules.market.news_flow_scheduler import (
     INGEST_INTERVAL_BREAK_SEC,
     INGEST_INTERVAL_NIGHT_SEC,
@@ -25,9 +25,10 @@ from src.modules.market.news_ingest import (
     ingest_news_sources,
     invalidate_dedup_index,
 )
+from src.modules.market.news_sources import NewsSourceSpec
 from src.modules.market.news_store import insert_news, insert_news_batch
-from src.platform.persistence.news_keys import TitleIndex
 from src.platform.persistence.models import MarketNews, MarketNewsDiscard, NewsDigest
+from src.platform.persistence.news_keys import TitleIndex
 
 SH = ZoneInfo("Asia/Shanghai")
 
@@ -40,7 +41,26 @@ def _factory():
     return sessionmaker(bind=engine)
 
 
-def _item(digest: str, *, minutes_ago: int = 5, md5: str = "", url: str = "") -> dict:
+def _fake_plan(groups: dict[str, list[dict]]) -> list[tuple[NewsSourceSpec, dict]]:
+    """构造只含指定源与条目的采集计划：入库逻辑不联网，也不依赖 data_sources 表。"""
+    return [
+        (
+            NewsSourceSpec(
+                key=key,
+                label=key,
+                description="",
+                config={},
+                # 默认参数把当轮的条目绑死，避免闭包共享循环变量。
+                fetch=lambda dedup, cfg, _items=items: list(_items),
+            ),
+            {},
+        )
+        for key, items in groups.items()
+    ]
+
+
+def _item(
+    digest: str, *, minutes_ago: int = 5, md5: str = "", url: str = "") -> dict:
     return {
         "digest": digest,
         "news_time": datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
@@ -179,21 +199,15 @@ def test_ingest_sources_returns_ids_newest_first(monkeypatch):
     db = factory()
     invalidate_dedup_index(db)
 
-    monkeypatch.setattr(
-        news_ingest, "_collect_ths", lambda **_: [_item("同花顺：某公司业绩预增", minutes_ago=30, md5="1" * 32)]
-    )
-    monkeypatch.setattr(
-        news_ingest,
-        "_collect_wallstreet",
-        lambda **_: [_item("华尔街见闻：央行宣布降准", minutes_ago=5, md5="2" * 32)],
-    )
-    monkeypatch.setattr(
-        news_ingest,
-        "_collect_stockstar",
-        lambda **_: [_item("证券之星：比亚迪公告回购", minutes_ago=20, md5="3" * 32)],
+    plan = _fake_plan(
+        {
+            "ths": [_item("同花顺：某公司业绩预增", minutes_ago=30, md5="1" * 32)],
+            "wallstreet": [_item("华尔街见闻：央行宣布降准", minutes_ago=5, md5="2" * 32)],
+            "stock_star": [_item("证券之星：比亚迪公告回购", minutes_ago=20, md5="3" * 32)],
+        }
     )
 
-    result = ingest_news_sources(db, parallel=False)
+    result = ingest_news_sources(db, parallel=False, plan=plan)
     assert len(result["created_ids"]) == 3
 
     rows = db.query(MarketNews).all()
@@ -209,18 +223,12 @@ def test_ingest_sources_builds_one_dedup_snapshot_for_all_sources(monkeypatch):
     db = factory()
     invalidate_dedup_index(db)
 
-    monkeypatch.setattr(
-        news_ingest, "_collect_ths", lambda **_: [_item("同花顺：A公司中标大单", minutes_ago=10, md5="1" * 32)]
-    )
-    monkeypatch.setattr(
-        news_ingest,
-        "_collect_wallstreet",
-        lambda **_: [_item("华尔街见闻：央行宣布降准", minutes_ago=5, md5="2" * 32)],
-    )
-    monkeypatch.setattr(
-        news_ingest,
-        "_collect_stockstar",
-        lambda **_: [_item("证券之星：B公司公告回购", minutes_ago=20, md5="3" * 32)],
+    plan = _fake_plan(
+        {
+            "ths": [_item("同花顺：A公司中标大单", minutes_ago=10, md5="1" * 32)],
+            "wallstreet": [_item("华尔街见闻：央行宣布降准", minutes_ago=5, md5="2" * 32)],
+            "stock_star": [_item("证券之星：B公司公告回购", minutes_ago=20, md5="3" * 32)],
+        }
     )
 
     calls = {"n": 0}
@@ -231,11 +239,11 @@ def test_ingest_sources_builds_one_dedup_snapshot_for_all_sources(monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(news_store, "load_news_dedup_snapshot", counting)
-    result = ingest_news_sources(db, parallel=False)
+    result = ingest_news_sources(db, parallel=False, plan=plan)
 
     assert calls["n"] == 1
     assert len(result["created_ids"]) == 3
-    assert (result["ths"], result["wallstreet"], result["stock_star"]) == (1, 1, 1)
+    assert result["sources"] == {"ths": 1, "wallstreet": 1, "stock_star": 1}
     db.close()
 
 
@@ -245,17 +253,16 @@ def test_ingest_sources_dedups_across_sources_in_one_round(monkeypatch):
     db = factory()
     invalidate_dedup_index(db)
 
-    monkeypatch.setattr(
-        news_ingest, "_collect_ths", lambda **_: [_item("宁德时代业绩预增超预期", minutes_ago=10, md5="1" * 32)]
+    # 入参顺序即入库顺序：ths 在前，同一事件的副本由 ths 入库，wallstreet 被跳过。
+    plan = _fake_plan(
+        {
+            "ths": [_item("宁德时代业绩预增超预期", minutes_ago=10, md5="1" * 32)],
+            "wallstreet": [_item("同花顺快讯：宁德时代业绩预增超预期", minutes_ago=12, md5="2" * 32)],
+            "stockstar": [],
+        }
     )
-    monkeypatch.setattr(
-        news_ingest,
-        "_collect_wallstreet",
-        lambda **_: [_item("同花顺快讯：宁德时代业绩预增超预期", minutes_ago=12, md5="2" * 32)],
-    )
-    monkeypatch.setattr(news_ingest, "_collect_stockstar", lambda **_: [])
 
-    result = ingest_news_sources(db, parallel=False)
+    result = ingest_news_sources(db, parallel=False, plan=plan)
     assert len(result["created_ids"]) == 1
     db.close()
 

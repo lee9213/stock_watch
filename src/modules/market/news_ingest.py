@@ -1,4 +1,10 @@
-"""多源新闻入库：同花顺 + 华尔街见闻 + 证券之星（新闻/研报）。"""
+"""事件驱动新闻采集：判重索引 + 按 data_sources 配置调度各源入库。
+
+各源怎么抓、字段怎么归一化在 ``news_sources``；这里只负责：
+建判重索引（抓详情前预判重）→ 按开关与顺序并行抓取 → 按顺序串行入库。
+顺序有意义：同一事件被多源同时报到时，先入库的那条留下，所以 priority 靠前的
+源等于「默认代表来源」。
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,10 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from src.modules.market.news_prefilter import should_ingest_news
+from src.modules.market.news_sources import (
+    NewsSourceSpec,
+    load_news_sources,
+)
 from src.modules.market.news_store import (
     TITLE_DUPLICATE_WINDOW_HOURS,
     NewsDedupSnapshot,
@@ -23,13 +33,6 @@ from src.modules.market.news_store import (
     is_within_ingest_window,
     prepare_news_items,
 )
-from src.modules.market.stockstar_news import (
-    fetch_stockstar_news,
-    fetch_stockstar_reports,
-    fetch_stockstar_roll,
-)
-from src.modules.market.ths_news import fetch_ths_flash
-from src.modules.market.wallstreet_news import fetch_wallstreet_hot
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import MarketNews, MarketNewsDiscard
 from src.platform.persistence.news_keys import TitleIndex, news_title_key
@@ -38,8 +41,8 @@ logger = logging.getLogger(__name__)
 
 # 判重索引的时间跨度：比入库判重的 ±12h 再宽一档，留出时钟/时区误差。
 TITLE_INDEX_WINDOW_HOURS = TITLE_DUPLICATE_WINDOW_HOURS + 12
-# 三源抓取并行度（纯网络 IO，不含写库）。
-SOURCE_FETCH_WORKERS = 3
+# 各源抓取并行度（纯网络 IO，不含写库）。默认源数是 6，按 3 会让后半批排队等。
+SOURCE_FETCH_WORKERS = 6
 # 判重索引的复用时长：同一进程内多轮采集（如手动「立即采集」与定时任务撞上）
 # 不必重复读两张 4000 行的表。过期只是多读一次库，不会漏判重（写入侧仍会判重）。
 DEDUP_INDEX_TTL_SEC = 60
@@ -198,57 +201,8 @@ def _insert_batch(
 
 
 # ---------------------------------------------------------------------------
-# 抓取（不含写库，可并行；判重索引只读，可跨线程共享）
+# 抓取调度（各源实现见 news_sources；判重索引只读，可跨线程共享）
 # ---------------------------------------------------------------------------
-
-
-def _collect_ths(*, pages: int, pagesize: int) -> list[dict]:
-    items: list[dict] = []
-    for page in range(1, max(int(pages or 1), 1) + 1):
-        items.extend(fetch_ths_flash(page=page, pagesize=pagesize))
-    return items
-
-
-def _collect_wallstreet(*, limit: int, dedup: IngestDedupIndex) -> list[dict]:
-    return fetch_wallstreet_hot(
-        limit=limit,
-        skip_urls=dedup.urls,
-        precheck=dedup.precheck,
-    )
-
-
-def _collect_stockstar(
-    *,
-    news_limit: int,
-    report_limit: int,
-    include_roll: bool,
-    dedup: IngestDedupIndex,
-) -> list[dict]:
-    items: list[dict] = list(
-        fetch_stockstar_news(
-            limit=news_limit,
-            skip_urls=dedup.urls,
-            precheck=dedup.precheck,
-        )
-    )
-    skip = set(dedup.urls) | {item.get("url") or "" for item in items}
-    items.extend(
-        fetch_stockstar_reports(
-            limit=report_limit,
-            skip_urls=skip,
-            precheck=dedup.precheck,
-        )
-    )
-    if include_roll:
-        skip |= {item.get("url") or "" for item in items}
-        items.extend(
-            fetch_stockstar_roll(
-                limit=max(2, news_limit // 2),
-                skip_urls=skip,
-                precheck=dedup.precheck,
-            )
-        )
-    return items
 
 
 def _run_collectors(
@@ -281,149 +235,77 @@ def _safe_collect(name: str, task: Callable[[], list[dict]]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def ingest_ths_news(db: Session | None = None, pagesize: int = 50, pages: int = 1) -> list[int]:
-    own = db is None
-    session = db or SessionLocal()
-    try:
-        created, enriched = _insert_batch(
-            session, _collect_ths(pages=pages, pagesize=pagesize)
-        )
-        if created or enriched:
-            logger.info(
-                "同花顺快讯入库 %s 条，回填关联股票 %s 条",
-                len(created),
-                enriched,
-            )
-        return [news_id for news_id, _ in created]
-    finally:
-        if own:
-            session.close()
-
-
-def ingest_wallstreet_news(db: Session | None = None, limit: int = 8) -> list[int]:
-    own = db is None
-    session = db or SessionLocal()
-    try:
-        dedup = IngestDedupIndex(session)
-        created, enriched = _insert_batch(
-            session, _collect_wallstreet(limit=limit, dedup=dedup)
-        )
-        if created or enriched:
-            logger.info(
-                "华尔街见闻入库 %s 条，回填 %s 条",
-                len(created),
-                enriched,
-            )
-        return [news_id for news_id, _ in created]
-    finally:
-        if own:
-            session.close()
-
-
-def ingest_stockstar_news(
-    db: Session | None = None,
-    *,
-    news_limit: int = 6,
-    report_limit: int = 4,
-    include_roll: bool = False,
-) -> list[int]:
-    own = db is None
-    session = db or SessionLocal()
-    try:
-        dedup = IngestDedupIndex(session)
-        created, enriched = _insert_batch(
-            session,
-            _collect_stockstar(
-                news_limit=news_limit,
-                report_limit=report_limit,
-                include_roll=include_roll,
-                dedup=dedup,
-            ),
-        )
-        if created or enriched:
-            logger.info(
-                "证券之星入库 %s 条，回填 %s 条",
-                len(created),
-                enriched,
-            )
-        return [news_id for news_id, _ in created]
-    finally:
-        if own:
-            session.close()
-
-
 def ingest_news_sources(
     db: Session | None = None,
     *,
-    ths_pages: int = 1,
-    ths_pagesize: int = 50,
-    wallstreet_limit: int = 8,
-    stockstar_news_limit: int = 6,
-    stockstar_report_limit: int = 4,
-    include_stockstar_roll: bool = False,
     parallel: bool = True,
+    plan: list[tuple[NewsSourceSpec, dict]] | None = None,
 ) -> dict:
-    """统一采集三源：并行抓取 → 串行入库。
+    """按 data_sources(type='event_news') 的开关与顺序采集一轮。
+
+    参数：
+    - ``plan``：显式指定源（测试/演练用）；为 None 时读数据库配置。
 
     返回：
-    - ths / wallstreet / stock_star：各源新入库条数
-    - created_ids：本次新入库的全部新闻 id，**按发布时间倒序**（最新先进分析队列；
-      此前按源分组拼接，积压时最新的一条反而最后才分析）
+    - ``sources``：``{provider: 新入库条数}``，键序即本轮入库顺序
+    - ``enabled``：本轮启用的源（按 priority 升序）
+    - ``created_ids``：新入库 id，**按 news_time 倒序**（最新先进分析队列）
+
+    入库顺序 = priority 顺序：同一事件被多源同时报到时，先入库的那条留下，
+    后到的因共享判重快照被跳过，所以排在最前的源等于「默认代表来源」。
     """
     own = db is None
     session = db or SessionLocal()
     try:
+        plan = plan if plan is not None else load_news_sources(session)
+        if not plan:
+            logger.info("事件驱动采集：没有启用的新闻源，本轮跳过")
+            return {"sources": {}, "enabled": [], "created_ids": []}
+
+        order = [spec.key for spec, _ in plan]
         dedup = IngestDedupIndex(session)
         groups = _run_collectors(
             {
-                "ths": lambda: _collect_ths(pages=ths_pages, pagesize=ths_pagesize),
-                "wallstreet": lambda: _collect_wallstreet(
-                    limit=wallstreet_limit, dedup=dedup
-                ),
-                "stock_star": lambda: _collect_stockstar(
-                    news_limit=stockstar_news_limit,
-                    report_limit=stockstar_report_limit,
-                    include_roll=include_stockstar_roll,
-                    dedup=dedup,
-                ),
+                spec.key: (lambda spec=spec, cfg=cfg: spec.collect(dedup, cfg))
+                for spec, cfg in plan
             },
             parallel=parallel,
         )
-        created: list[tuple[int, datetime]] = []
-        counts = {"ths": 0, "wallstreet": 0, "stock_star": 0}
-        # 三个来源共用一份判重快照：原来每个来源各建一次（每次都要扫一遍
-        # 标题窗口 + 两轮 IN 查询），一轮下来 12~21 条 SQL 全在 market_news 上。
+
         prepared = [
             prepare_news_items(
                 [
                     item
-                    for item in (groups.get(group) or [])
+                    for item in (groups.get(key) or [])
                     if is_within_ingest_window(item.get("news_time"))
                     and should_ingest_news(item)
                 ]
             )
-            for group in ("ths", "wallstreet", "stock_star")
+            for key in order
         ]
         pooled = [rows for rows in prepared if rows]
         snapshot = build_dedup_snapshot(session, pooled) if pooled else None
-        for group in ("ths", "wallstreet", "stock_star"):
-            rows, _ = _insert_batch(session, groups.get(group) or [], snapshot=snapshot)
-            counts[group] = len(rows)
+
+        counts: dict[str, int] = {}
+        created: list[tuple[int, datetime]] = []
+        for key in order:
+            rows, _ = _insert_batch(session, groups.get(key) or [], snapshot=snapshot)
+            counts[key] = len(rows)
             created.extend(rows)
         created.sort(key=lambda pair: pair[1], reverse=True)
-        result = {
-            **counts,
-            "created_ids": [news_id for news_id, _ in created],
-        }
+
         total = len(created)
         if total:
             logger.info(
-                "多源新闻采集完成：同花顺 %s / 华尔街见闻 %s / 证券之星 %s",
-                result["ths"],
-                result["wallstreet"],
-                result["stock_star"],
+                "事件驱动采集完成 %s 条：%s",
+                total,
+                " / ".join(f"{key}={counts[key]}" for key in order),
             )
-        return result
+        return {
+            "sources": counts,
+            "enabled": order,
+            "created_ids": [news_id for news_id, _ in created],
+        }
     finally:
         if own:
             session.close()

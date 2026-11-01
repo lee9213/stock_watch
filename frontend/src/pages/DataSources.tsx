@@ -1,6 +1,6 @@
 import { useConfirm } from '@panwatch/base-ui/components/ui/confirm-dialog'
 import { useState, useEffect } from 'react'
-import { Pencil, Play, Database, Newspaper, LineChart, TrendingUp, DollarSign, Image, Layers, Zap, Check, X, Clock, Trash2, ChevronUp, ChevronDown, ChevronRight, Eye, EyeOff, RotateCcw, AlertTriangle, BarChart3, Trophy, Landmark, Users, Gift, ArrowLeftRight } from 'lucide-react'
+import { Pencil, Play, Database, Newspaper, LineChart, TrendingUp, DollarSign, Image, Layers, Zap, Radio, Check, X, Clock, Trash2, ChevronUp, ChevronDown, ChevronRight, Eye, EyeOff, RotateCcw, AlertTriangle, BarChart3, Trophy, Landmark, Users, Gift, ArrowLeftRight } from 'lucide-react'
 import { fetchAPI, resetDataSourcesToSeed, type DataSource } from '@panwatch/api'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
@@ -81,6 +81,7 @@ const DATASOURCE_TYPES = {
   events: { icon: Layers, color: 'text-violet-500' },
   chart: { icon: Image, color: 'text-purple-500' },
   flash_news: { icon: Zap, color: 'text-amber-500' },
+  event_news: { icon: Radio, color: 'text-rose-500' },
   fundamentals: { icon: BarChart3, color: 'text-indigo-500' },
   dragon_tiger: { icon: Trophy, color: 'text-red-500' },
   margin: { icon: Landmark, color: 'text-cyan-500' },
@@ -92,7 +93,7 @@ const DATASOURCE_TYPES = {
 // 数据源分类分组:仅用于页面展示时的二级归组,不影响数据结构与后端
 const DATASOURCE_CATEGORIES: { key: string; types: string[] }[] = [
   { key: 'quote_kline', types: ['quote', 'kline'] },
-  { key: 'news', types: ['news', 'flash_news', 'events'] },
+  { key: 'news', types: ['event_news', 'news', 'flash_news', 'events'] },
   { key: 'fundamentals', types: ['fundamentals'] },
   { key: 'capital', types: ['capital_flow', 'dragon_tiger', 'margin', 'shareholders', 'northbound', 'dividend'] },
   { key: 'chart', types: ['chart'] },

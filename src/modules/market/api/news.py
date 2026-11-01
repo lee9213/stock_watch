@@ -2,15 +2,10 @@
 import logging
 import time
 
-from src.web.datetime import as_utc
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from src.platform.persistence.database import get_db
-from src.platform.persistence.models import Stock, DataSource
-from src.platform.marketdata.collectors.news_collector import NewsCollector, NewsItem
 from src.modules.market import news_flow
 from src.modules.market.news_digest_job import (
     acquire_refresh_lock,
@@ -19,6 +14,10 @@ from src.modules.market.news_digest_job import (
     release_refresh_lock,
 )
 from src.modules.market.news_store import recent_digests
+from src.platform.marketdata.collectors.news_collector import NewsCollector, NewsItem
+from src.platform.persistence.database import get_db
+from src.platform.persistence.models import Stock
+from src.web.datetime import as_utc
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -148,23 +147,13 @@ async def get_news(
 
 @router.get("/sources")
 def get_news_sources(db: Session = Depends(get_db)):
-    """获取已配置的新闻数据源列表"""
-    data_sources = (
-        db.query(DataSource)
-        .filter(DataSource.type == "news")
-        .order_by(DataSource.priority)
-        .all()
-    )
+    """事件驱动新闻源及其开关/顺序（与数据源管理页同一份配置）。
 
-    return [
-        {
-            "id": ds.provider,
-            "name": ds.name,
-            "enabled": ds.enabled,
-            "priority": ds.priority,
-        }
-        for ds in data_sources
-    ]
+    顺序即入库顺序：priority 越小越先入库，同一事件被多源报到时先入库的留下。
+    """
+    from src.modules.market.news_sources import source_summary
+
+    return source_summary(db)
 
 
 @router.get("/flow/topics")

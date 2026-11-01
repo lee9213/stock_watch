@@ -181,6 +181,7 @@ export const configuration = {
       events: 'Event calendar',
       chart: 'Chart screenshots',
       flash_news: 'Breaking news',
+      event_news: 'Event-driven news',
       fundamentals: 'Fundamentals',
       dragon_tiger: 'Dragon and Tiger List',
       margin: 'Margin financing',

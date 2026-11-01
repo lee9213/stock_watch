@@ -23,6 +23,7 @@ TYPE_LABELS = {
     "events": "事件日历",
     "chart": "K线截图",
     "flash_news": "快讯",
+    "event_news": "事件驱动新闻",
     "fundamentals": "基本面",
     "dragon_tiger": "龙虎榜",
     "margin": "融资融券",

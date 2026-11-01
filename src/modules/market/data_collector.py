@@ -2,16 +2,15 @@
 
 import asyncio
 import logging
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from marketdata import PACKAGE_VENDORS_BY_TYPE, capture_errors
 
+from src.platform.marketdata.models import MarketCode
 from src.platform.persistence.database import SessionLocal
 from src.platform.persistence.models import DataSource
-from src.platform.marketdata.models import MarketCode
 
 # 数据源测试的统一样本。每个市场固定两个稳定、容易识别的代码，避免新建数据源
 # 时只测到 A 股，导致港股/美股 provider 的市场路由问题直到生产才暴露。
@@ -83,9 +82,13 @@ class DataCollectorManager:
 
     def _register_collectors(self):
         """注册所有采集器"""
+        from src.platform.marketdata.collectors.capital_flow_collector import (
+            CapitalFlowCollector,
+        )
+        from src.platform.marketdata.collectors.events_collector import (
+            EastMoneyEventsCollector,
+        )
         from src.platform.marketdata.collectors.kline_collector import KlineCollector
-        from src.platform.marketdata.collectors.capital_flow_collector import CapitalFlowCollector
-        from src.platform.marketdata.collectors.events_collector import EastMoneyEventsCollector
 
         self.COLLECTOR_FACTORIES = {
             "kline": {
@@ -286,7 +289,9 @@ class DataCollectorManager:
 
     async def collect_capital_flow(self, symbol: str) -> CollectorResult:
         """采集资金流向"""
-        from src.platform.marketdata.collectors.capital_flow_collector import CapitalFlowCollector
+        from src.platform.marketdata.collectors.capital_flow_collector import (
+            CapitalFlowCollector,
+        )
 
         start_time = datetime.now()
         self._log("资金流向", "capital_flow", "start", f"获取 {symbol} 的资金流向")
@@ -441,7 +446,9 @@ class DataCollectorManager:
             return await self._test_kline_source(source, test_symbols)
 
         elif source.type == "capital_flow":
-            from src.platform.marketdata.collectors.capital_flow_collector import CapitalFlowCollector
+            from src.platform.marketdata.collectors.capital_flow_collector import (
+                CapitalFlowCollector,
+            )
 
             collector = CapitalFlowCollector(MarketCode.CN)
             results = []
@@ -469,8 +476,11 @@ class DataCollectorManager:
             return await self._test_quote_source(source, test_symbols)
 
         elif source.type == "chart":
-            from src.platform.marketdata.collectors.screenshot_collector import ScreenshotCollector
             import base64
+
+            from src.platform.marketdata.collectors.screenshot_collector import (
+                ScreenshotCollector,
+            )
 
             collector = ScreenshotCollector(config={"extra_wait_ms": 3000})
             try:
@@ -494,9 +504,11 @@ class DataCollectorManager:
                 await collector.close()
 
         elif source.type == "events":
-            from src.platform.marketdata.collectors.events_collector import EastMoneyEventsCollector
-
             from datetime import timedelta
+
+            from src.platform.marketdata.collectors.events_collector import (
+                EastMoneyEventsCollector,
+            )
 
             # Use a longer window for tests to avoid "recently empty" false negatives.
             # This is only for connectivity/format validation, not for production logic.
@@ -542,6 +554,9 @@ class DataCollectorManager:
 
         elif source.type == "flash_news":
             return await self._test_flash_news_source(source)
+
+        elif source.type == "event_news":
+            return await self._test_event_news_source(source)
 
         elif source.type == "fundamentals":
             return await self._test_fundamentals_source(source)
@@ -757,6 +772,54 @@ class DataCollectorManager:
                     "symbols": i.symbols,
                 }
                 for i in items[:10]
+            ],
+            count=len(items),
+            error="" if items else "未获取到快讯数据",
+        )
+
+    async def _test_event_news_source(self, source: DataSource) -> CollectorResult:
+        """测试事件驱动新闻源：直接跑该源的采集适配器（与正式采集同一段代码）。
+
+        测试要回答的是「这个源还能不能连通」，所以关闭 ``market_only`` 相关性闸门，
+        否则一轮只有海外政治/天气时会被全过滤，看起来像源挂了。
+        """
+        from src.modules.market.news_sources import NEWS_SOURCE_SPECS
+
+        spec = NEWS_SOURCE_SPECS.get(source.provider)
+        if spec is None:
+            return CollectorResult(
+                success=False,
+                error=f"provider {source.provider} 无对应的采集适配器",
+            )
+
+        class _NoDedup:
+            """测试用空判重：不跳过任何条目。"""
+
+            urls = frozenset()
+
+            def precheck(self, *args, **kwargs) -> bool:
+                return False
+
+            def is_duplicate_title(self, *args, **kwargs) -> bool:
+                return False
+
+        cfg = {**(source.config or {}), "market_only": False}
+        try:
+            items = await asyncio.to_thread(spec.collect, _NoDedup(), cfg)
+        except Exception as e:
+            return CollectorResult(success=False, error=str(e))
+
+        return CollectorResult(
+            success=len(items) > 0,
+            data=[
+                {
+                    "title": (item.get("title") or item.get("digest") or "")[:80],
+                    "time": item["news_time"].strftime("%m-%d %H:%M")
+                    if item.get("news_time")
+                    else "",
+                    "symbols": [s.get("code") for s in item.get("relations_stocks") or []],
+                }
+                for item in items[:10]
             ],
             count=len(items),
             error="" if items else "未获取到快讯数据",

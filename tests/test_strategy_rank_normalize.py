@@ -11,7 +11,6 @@ from src.modules.strategy.strategy_engine import (
     _normalize_actionable_rank,
 )
 
-
 _seq = iter(range(100000))
 
 
@@ -70,6 +69,21 @@ def test_single_actionable_stock_is_not_topped_out():
     assert breakdown["absolute_score"] == 145.781  # 不封顶
     # payload 与 breakdown 必须给出同一个绝对分（旧版分别写 136.05 / 145.78）
     assert rows[0].payload["absolute_score"] == breakdown["absolute_score"]
+
+
+def test_absolute_score_stays_per_row_while_rank_is_shared():
+    """同一只票的多条策略：rank 共享（排序比的是股票），absolute 各报各的。
+
+    旧版把股票级最高值写进每一行，600519 的四条策略全读 145.78，而实际合成分是
+    145.78 / 139.44 / 125.98 / 136.05 —— 三条行报的是别人的分。
+    """
+    scores = [145.781, 139.4427, 125.9759, 136.054]
+    rows = [_row(s, symbol="600519") for s in scores]
+    _normalize_actionable_rank(rows=rows)
+    assert {r.rank_score for r in rows} == {87.5}
+    assert [r.payload["absolute_score"] for r in rows] == scores
+    for r in rows:
+        assert r.payload["absolute_score"] == r.payload["score_breakdown"]["absolute_score"]
 
 
 def test_format_signal_keeps_unbounded_absolute_score():

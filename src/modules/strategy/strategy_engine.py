@@ -900,8 +900,9 @@ def _is_actionable(row: StrategySignalRun) -> bool:
 
 def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
     """可执行信号按同日同市场百分位重映射到 75~100（开区间），避免叠加分数集体封顶 100 后无法排序。
-    按股票排名：同一只股票的各策略行取其最高 composite，共享同一个分数，
-    排序比的是股票而不是同股的策略权重。返回重映射条数。
+    按股票排名：同一只股票的各策略行取其最高 composite 决定百分位，因此同股各行共享
+    同一个 ``rank_score``——排序比的是股票而不是同股的策略权重。``absolute_score``
+    仍然是每行自己的合成分，不共享。
 
     百分位用中点口径 ``(idx + 0.5) / n``（等价于"偏离中位按 (n-1)/n 收缩"）：
     旧口径 ``idx / (n - 1)`` 在 n=1 时除零，退回 ``pct = 1.0``，即"当日只有 1 只可执行票
@@ -931,14 +932,16 @@ def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
         levels = sorted(set(stock_best.values()))
         n = len(levels)
         level_index = {value: idx for idx, value in enumerate(levels)}
-        for row, _composite in items:
+        for row, row_composite in items:
             stock_score = stock_best[(row.stock_symbol or "").strip()]
             # 中点百分位 ∈ (0, 1)；n=1 时恰为 0.5，样本不足也不会被顶到上限。
             pct = (level_index.get(stock_score, 0) + 0.5) / n
             score = round(ACTIONABLE_RANK_FLOOR + span * pct, 4)
-            # absolute_score 是未封顶的加权合成分，可以超过 100（实测 145.78）——
-            # 它衡量"绝对强度"，跨日可比；要 0-100 的展示分请用 percentile_score。
-            absolute = round(float(stock_score), 4)
+            # absolute_score 写这一行自己的合成分（未封顶，可超过 100），不是股票级最高值。
+            # 股票级最高值只用来决定百分位——若把它写进每一行，600519 的四条策略会全部
+            # 显示 145.78，而它们的实际合成分是 145.78 / 139.44 / 125.98 / 136.05，
+            # 三条行报的是别人的分。
+            absolute = round(float(row_composite), 4)
             payload = dict(row.payload) if isinstance(row.payload, dict) else {}
             breakdown = dict(payload.get("score_breakdown") or {})
             # 语义拆分：absolute_score 是未封顶的加权合成分（跨日可比，可 >100），
@@ -949,9 +952,9 @@ def _normalize_actionable_rank(*, rows: list[StrategySignalRun]) -> int:
             breakdown["weighted_score"] = score
             breakdown["rank_pct"] = round(pct * 100.0, 2)
             payload["score_breakdown"] = breakdown
-            # 同一只票的多条策略行共享股票级分数，payload 与 breakdown 必须一致——
-            # 之前 payload 写的是每行自己的 composite，接口按 breakdown 优先读，
-            # 两条路径给出不同分数（实测 136.05 vs 145.78）。
+            # 顶层与 breakdown 必须给出同一个数：旧版 payload 写每行 composite、
+            # breakdown 写股票最高值，接口按 breakdown 优先读，换个入口就换个数
+            # （实测 136.05 vs 145.78）。
             payload["absolute_score"] = absolute
             payload["percentile_score"] = score
             row.payload = to_jsonable(payload)
@@ -1110,6 +1113,37 @@ def _apply_portfolio_constraints(*, rows: list[StrategySignalRun]) -> dict:
     return {"demoted": demoted, "by_reason": by_reason}
 
 
+def _capped_display_score(
+    composite_score: float,
+    *,
+    status: str | None,
+    action: str,
+    has_entry: bool,
+    is_holding: bool,
+) -> float:
+    """合成分 → 0-100 展示分：非 active、只观察、没有买点都要降档。
+
+    ``composite_score`` 是未封顶的绝对强度（可以超过 100），``rank_score`` 是
+    用户看到的分数，必须和"现在能不能买"保持一致，所以这里按状态逐级封顶。
+
+    抽成独立函数是因为历史评分也要走同一条路径
+    （``scripts/repair_strategy_scores.py``）。两处各写一份的话，改了一处就会
+    出现两套门槛——正是这轮要修的问题本身。
+    """
+    score = _clamp(composite_score, 0.0, 100.0)
+    # Keep score semantics aligned with action/status: high scores should be actionable.
+    if (status or "inactive") != "active":
+        score = min(score, float(CAP_INACTIVE_SCORE))
+    if action in ("hold", "watch"):
+        score = min(
+            score,
+            float(CAP_WATCH_HOLDING) if is_holding else float(CAP_WATCH_UNHELD),
+        )
+    if action in ("buy", "add") and not has_entry:
+        score = min(score, float(CAP_NO_ENTRY_PLAN))
+    return score
+
+
 def _compute_factor_breakdown(
     *,
     row: EntryCandidate,
@@ -1249,17 +1283,13 @@ def _compute_factor_breakdown(
     if action in ("buy", "add") and plan_quality < 90:
         raw_score -= 6.0
     composite_score = raw_score * float(weight or 1.0) * regime_multiplier
-    final_score = _clamp(composite_score, 0.0, 100.0)
-    # Keep score semantics aligned with action/status: high scores should be actionable.
-    if (row.status or "inactive") != "active":
-        final_score = min(final_score, float(CAP_INACTIVE_SCORE))
-    if action in ("hold", "watch"):
-        final_score = min(
-            final_score,
-            float(CAP_WATCH_HOLDING) if is_holding else float(CAP_WATCH_UNHELD),
-        )
-    if action in ("buy", "add") and not has_entry:
-        final_score = min(final_score, float(CAP_NO_ENTRY_PLAN))
+    final_score = _capped_display_score(
+        composite_score,
+        status=row.status,
+        action=action,
+        has_entry=has_entry,
+        is_holding=is_holding,
+    )
 
     return {
         "base_score": round(base_score, 4),

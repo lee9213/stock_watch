@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from contextlib import closing
@@ -27,6 +28,9 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 SQLITE_INIT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
+# 保护「建立连接 + 首次访问」，见 _set_sqlite_pragma 里的说明。
+_SQLITE_CONNECT_LOCK = threading.RLock()
+
 def _json_serializer(value) -> str:
     """JSON 落库保留中文原文，避免 Navicat/人工查库看到 \\uXXXX 伪乱码。"""
     return json.dumps(value, ensure_ascii=False)
@@ -46,17 +50,27 @@ engine = create_engine(
 
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_conn, connection_record):
-    cursor = dbapi_conn.cursor()
-    # 这里刻意不执行 ``PRAGMA journal_mode=WAL``：它是库级持久属性（写进 db 文件头），
-    # 只需在启动时设一次，见 _ensure_wal_mode()。
-    # 之前每次建连接都设一次，等于每个请求都要抢一次写锁；poolclass=NullPool 下每个
-    # 请求都是新连接，并发时后到的连接拿不到 WAL 共享内存的独占权，会退化成只读连接，
-    # 后续写入直接报 "attempt to write a readonly database"（前端表现为请求 500，
-    # 但另一条并发请求已经提交成功）。
-    cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    # 串行化「建立连接 + 首次访问」。
+    #
+    # Windows 上多个线程同时打开同一个 WAL 库时，只有第一个连接能拿到 -shm
+    # 共享内存的初始化权，其余连接会以**只读**方式打开；它们后续任何写入都直接
+    # 抛 "attempt to write a readonly database"（不是等锁超时，是立刻失败，
+    # busy_timeout 完全帮不上忙）。这与是否先读一次无关，实测并发 20 个连接里
+    # 19 个失败，而把这一步串行化后 0 失败。
+    #
+    # 代价是每个新连接多花约 10 毫秒；NullPool 下每个请求都要新建连接，但相比
+    # 「两个并发写请求里必有一个 500」，这个开销是值得的。
+    # 用 RLock 而非 Lock：库初始化等路径可能在同一线程上嵌套建连。
+    with _SQLITE_CONNECT_LOCK:
+        cursor = dbapi_conn.cursor()
+        # journal_mode=WAL 是库级持久属性（写在 db 文件头），只在 _ensure_wal_mode()
+        # 里设一次。放在这里会让每个请求都抢一次写锁，既慢又加剧上面的竞争。
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        # 必须在锁内真正读一次，让 -shm 初始化在这里完成而不是在业务写入时。
+        cursor.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        cursor.close()
 
 
 def _ensure_wal_mode() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 TITLE_KEY_LENGTH = 30
@@ -126,3 +127,171 @@ def has_similar_title(key: str, candidates: Iterable[str]) -> bool:
         if matcher.ratio() >= TITLE_SIMILARITY_THRESHOLD:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# 正文相似度：标题判重的补充
+#
+# 同一事件被多家改写时，首句往往**完全不同**，标题判重必然漏：
+#   海洋王(002724.SZ)公告股价10个交易日涨幅偏离值累计超100%…
+#   海洋王11月1日披露股票严重异常波动公告，称AI+智慧照明业务收入规模有限…
+# 但正文里的事件要素（股票、异常波动、10个交易日、AI+智慧照明、收入规模有限）
+# 高度重合。所以再加一层「全文 2-gram Jaccard」。
+#
+# 实测 168 条历史新闻标定：真重复对落在 0.33~0.68，而假重复对（赛力斯 vs 上汽
+# 集团，两条都是「XX公告10月销量…同比下降X%」模板）落在 0.30~0.32。光看文本
+# 相似度两个区间是重叠的，必须叠加「实体」约束：两条都认出了主体且主体不同时，
+# 直接不合并；有共同主体才放宽到 0.30。
+# ---------------------------------------------------------------------------
+CONTENT_GRAM_SIZE = 2
+# 正文只取前 400 字做指纹：事件要素几乎都在开头，全文参与会让不同长度的报道
+# 相似度被稀释，也白白消耗 CPU。
+CONTENT_SIGNATURE_LENGTH = 400
+# 两条都认出主体且主体相同（同一只股票/同一家机构）时的阈值。
+CONTENT_JACCARD_SAME_ENTITY = 0.30
+# 至少一方认不出主体时（多为宏观/政策类）的阈值：调高是因为此时没有主体兜底，
+# 0.30 会误伤「不同公司但因公告模板相似」的条目。
+CONTENT_JACCARD_NO_ENTITY = 0.45
+
+# 事件类型：同一主体 + 同一类型，基本可以断定是同一件事，不必再看文本相似度。
+# 实测「上汽集团 10 月销量」三条正文相似度只有 0.19~0.54、「海洋王异常波动」四条
+# 低到 0.18，单看阈值要放到 0.18 才抓得住，而那个区间又会把同公司不同类型公告
+# 卷进来。分类后 14 对同主体同类型的样本全部是真重复，无一误合。
+# 顺序即优先级：先命中者为准。
+_EVENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("异常波动", ("异常波动", "涨幅偏离值", "跌幅偏离值", "严重异常")),
+    ("立案", ("立案", "行政处罚", "警示函", "监管措施", "退市风险")),
+    ("回购", ("回购",)),
+    ("增减持", ("增持", "减持")),
+    ("业绩", ("三季报", "半年报", "年报", "业绩预告", "业绩快报", "净利润", "营收")),
+    ("重组", ("重组", "收购", "并购", "资产购买", "发行股份购买", "股权转让")),
+    ("订单", ("中标", "订单", "签约", "合同金额", "框架协议")),
+    ("分红", ("分红", "派息", "派现", "权益分派")),
+    ("产销", ("销量", "产销", "销售量", "交付量")),
+    ("停牌", ("停牌", "复牌")),
+)
+
+# 6 位证券代码：002724 / 002724.SZ / 688613.SH 都认。
+_ENTITY_CODE = re.compile(r"(?<!\d)(\d{6})(?:\.(?:SZ|SH|BJ|sz|sh|bj))?")
+# 「奥精医疗(688613.SH)」这种自带代码的写法最可靠。
+_ENTITY_NAMED_CODE = re.compile(r"([A-Za-z\u4e00-\u9fa5*]{2,6})[（(](\d{6})")
+# 句首「XX公告 / XX披露 / XX公布 / XX拟 / XX收到」——只在开头找，避免把正文里
+# 随手提到的公司都当成主体（实测全文扫描会抽出「日俄乌双方」「发布分析报告」这类噪声）。
+# 名字部分用**非贪婪**：贪婪会把「奥精医疗公告」整个吃掉（拿「收到」当动作词）。
+_ENTITY_HEAD = re.compile(
+    r"([A-Za-z\u4e00-\u9fa5*]{2,6}?)"
+    r"(?:\d{1,2}月\d{1,2}日(?:晚|早)?|晚间|早间)?"
+    r"(?:公告|公布|披露|发布|拟|宣布|收到|签约|中标|增持|回购)"
+)
+# 句首之前常有的日期/媒体署名，先剥掉再找主体。
+_LEAD_NOISE = re.compile(
+    r"^(?:"
+    r"(?:财联社|证券时报|券商中国|上海证券报|中国证券报|每日经济新闻|界面新闻|"
+    r"新浪财经|华尔街见闻|金十数据|智通财经|新华社|人民日报)"
+    r"(?:\d{1,2}月\d{1,2}日)?(?:报道|讯|获悉|消息)?[，,：:]?"
+    r"|(?:19|20)\d{2}年\d{1,2}月\d{1,2}日(?:晚|早)?[，,]?"
+    r"|\d{1,2}月\d{1,2}日(?:晚|早)?[，,]?"
+    r"|当地时间\d{1,2}月\d{1,2}日[，,]?"
+    r"|(?:近日|昨日|今日|本周|上周|晚间|早间)[，,]?"
+    r")+"
+)
+# 这些词后面跟着「公告/发布」也不能当主体（它们不是特定公司）。
+_ENTITY_STOP = frozenset(
+    {
+        "公司", "公告", "三季报", "半年报", "年报", "季报", "业绩", "市场", "行业",
+        "银行", "券商", "记者", "报道", "消息", "数据", "今日", "昨日", "本周",
+        "上周", "我国", "全国", "美国", "韩国", "日本", "印度", "欧盟", "双方",
+        "团队", "分析师", "机构", "部门", "会议", "政策", "报告",
+    }
+)
+
+
+def content_grams(text: str | None, *, limit: int = CONTENT_SIGNATURE_LENGTH) -> frozenset[str]:
+    """正文前 N 字的 2-gram 集合（去标点空白）。"""
+    cleaned = _TITLE_STRIP.sub("", (text or "")[:limit])
+    size = CONTENT_GRAM_SIZE
+    if len(cleaned) < size:
+        return frozenset()
+    return frozenset(cleaned[i : i + size] for i in range(len(cleaned) - size + 1))
+
+
+def news_entities(text: str | None) -> frozenset[str]:
+    """抽取新闻主体：证券代码 + 句首「XX公告」里的公司名。
+
+    只认三种高置信写法，宁可抽不到也不引入噪声——抽错的代价是把两家不同公司
+    的新闻当成一条合并掉。
+    """
+    blob = (text or "").strip()
+    if not blob:
+        return frozenset()
+    head = blob[:60]
+    entities: set[str] = set()
+
+    for name, code in _ENTITY_NAMED_CODE.findall(head):
+        if name not in _ENTITY_STOP:
+            entities.add(name)
+        entities.add(code)
+    entities.update(_ENTITY_CODE.findall(head))
+
+    stripped = _LEAD_NOISE.sub("", head)
+    match = _ENTITY_HEAD.match(stripped)
+    if match and match.group(1) not in _ENTITY_STOP:
+        entities.add(match.group(1))
+    return frozenset(entities)
+
+
+@dataclass(frozen=True)
+class ContentSignature:
+    """一条新闻的正文指纹：2-gram 集合 + 主体 + 事件类型。"""
+
+    grams: frozenset[str]
+    entities: frozenset[str]
+    event: str | None = None
+
+
+def contents_duplicate(
+    a: "ContentSignature",
+    b: "ContentSignature",
+) -> bool:
+    """正文指纹判重。
+
+    判定顺序（每一层都在实测样本上标定过）：
+
+    1. 两条都认出了主体且主体**不同** → 直接放行。这一步挡掉「赛力斯 / 上汽集团
+       都发『10月销量同比下降X%』」这类同模板不同公司的误合并。
+    2. 主体相同且事件类型相同（都是「异常波动」「回购」…）→ 同一件事，合并。
+    3. 主体相同但类型不同 → 看文本相似度是否 ≥ 0.30。
+    4. 至少一方认不出主体（宏观/政策/海外）→ 文本相似度要达到 0.45。
+    """
+    if not a.grams or not b.grams:
+        return False
+    overlap = len(a.grams & b.grams)
+    if not overlap:
+        return False
+    if a.entities and b.entities:
+        if not (a.entities & b.entities):
+            return False
+        if a.event and a.event == b.event:
+            return True
+        jaccard = overlap / (len(a.grams) + len(b.grams) - overlap)
+        return jaccard >= CONTENT_JACCARD_SAME_ENTITY
+    jaccard = overlap / (len(a.grams) + len(b.grams) - overlap)
+    return jaccard >= CONTENT_JACCARD_NO_ENTITY
+
+
+def news_event_type(text: str | None) -> str | None:
+    """粗分事件类型；认不出返回 None。"""
+    blob = text or ""
+    for name, keywords in _EVENT_KEYWORDS:
+        if any(keyword in blob for keyword in keywords):
+            return name
+    return None
+
+
+def content_signature(text: str | None) -> "ContentSignature":
+    """一条新闻的正文指纹。"""
+    return ContentSignature(
+        grams=content_grams(text),
+        entities=news_entities(text),
+        event=news_event_type(text),
+    )

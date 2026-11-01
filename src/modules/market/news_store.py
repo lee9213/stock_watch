@@ -15,7 +15,11 @@ from sqlalchemy.orm import Session
 
 from src.platform.persistence.models import MarketNews, MarketNewsDiscard, NewsDigest
 from src.platform.persistence.news_keys import (
+    CONTENT_SIGNATURE_LENGTH,
+    ContentSignature,
     TitleIndex,
+    content_signature,
+    contents_duplicate,
     has_similar_title,
     news_title_key,
 )
@@ -536,7 +540,7 @@ class NewsDedupSnapshot:
     两者相差十几小时，只按发布时间开窗时，同一事件换个来源再进来会落在窗口外。
     """
 
-    __slots__ = ("_now", "_window", "md5s", "titles", "urls")
+    __slots__ = ("_now", "_window", "md5s", "titles", "urls", "_contents")
 
     def __init__(
         self,
@@ -549,17 +553,36 @@ class NewsDedupSnapshot:
         self.titles = TitleIndex(window_hours)
         self._now = _aware(now) or datetime.now(timezone.utc)
         self._window = timedelta(hours=max(1, int(window_hours)))
+        # 正文指纹：标题判重只能拦住「首句几乎一样」的转载，拦不住同一事件被
+        # 各家改写成完全不同的标题（见 news_keys.contents_duplicate 的说明）。
+        self._contents: list[ContentSignature] = []
 
-    def add(self, md5: str, url: str, title_key: str, moment: datetime | None) -> None:
+    def add(self, md5: str, url: str, title_key: str, moment: datetime | None, digest: str = "") -> None:
         if md5:
             self.md5s.add(md5)
         if url:
             self.urls.add(url)
         if title_key:
             self.titles.add_anchors(title_key, moment, self._now)
+        self.add_content(digest, moment)
 
-    def blocked(self, md5: str, url: str, title_key: str, moment: datetime | None) -> bool:
-        """与 insert_news 的判重口径一致：md5 / 链接 / ±12h 相似标题。
+    def add_content(self, digest: str, moment: datetime | None) -> None:
+        """记录一条正文指纹，供后续候选做「同事件改写」判重。"""
+        if not digest:
+            return
+        signature = content_signature(digest)
+        if signature.grams:
+            self._contents.append(signature)
+
+    def blocked(
+        self,
+        md5: str,
+        url: str,
+        title_key: str,
+        moment: datetime | None,
+        digest: str = "",
+    ) -> bool:
+        """与 insert_news 的判重口径一致：md5 / 链接 / ±12h 相似标题 / 正文相似。
 
         候选本身就是旧文（发布时间比现在早一个窗口以上）时，再按「入库时刻」
         比一次：转载常常隔十几小时才被另一个来源收进来，两条的发布时间差远超
@@ -571,12 +594,26 @@ class NewsDedupSnapshot:
             return True
         if self.titles.has_similar(title_key, moment):
             return True
-        return bool(
+        if (
             title_key
             and moment is not None
             and moment < self._now - self._window
             and self.titles.has_similar(title_key, self._now)
-        )
+        ):
+            return True
+        return self.blocked_by_content(digest)
+
+    def blocked_by_content(self, digest: str) -> bool:
+        """正文 2-gram 相似度判重（标题被改写的同一事件）。"""
+        if not digest or not self._contents:
+            return False
+        signature = content_signature(digest)
+        if not signature.grams:
+            return False
+        for other in self._contents:
+            if contents_duplicate(signature, other):
+                return True
+        return False
 
 
 def load_news_dedup_snapshot(
@@ -599,29 +636,52 @@ def load_news_dedup_snapshot(
             snapshot.urls.update(str(row[0]) for row in rows if row[0])
     now = datetime.now(timezone.utc)
     window = timedelta(hours=TITLE_DUPLICATE_WINDOW_HOURS)
-    for model, ingested_col in (
-        (MarketNews, MarketNews.created_at),
-        (MarketNewsDiscard, MarketNewsDiscard.discarded_at),
-    ):
-        rows = (
-            db.query(model.title_key, model.news_time, ingested_col)
-            .filter(
-                model.title_key != "",
-                model.news_time.isnot(None),
-                or_(
-                    and_(model.news_time >= start, model.news_time <= end),
-                    and_(ingested_col >= now - window, ingested_col <= now + window),
-                ),
-            )
-            .all()
+    in_window = or_(
+        and_(MarketNews.news_time >= start, MarketNews.news_time <= end),
+        and_(MarketNews.created_at >= now - window, MarketNews.created_at <= now + window),
+    )
+    # 正文只取前 CONTENT_SIGNATURE_LENGTH 字：事件要素都在开头，全取会白读
+    # 几十 KB 文本、也会稀释相似度。
+    rows = (
+        db.query(
+            MarketNews.title_key,
+            MarketNews.news_time,
+            MarketNews.created_at,
+            func.substr(MarketNews.digest, 1, CONTENT_SIGNATURE_LENGTH),
         )
-        for key, moment, ingested_at in rows:
-            if not key:
-                continue
-            aware = _aware(moment)
-            if aware is None:
-                continue
+        .filter(MarketNews.title_key != "", MarketNews.news_time.isnot(None), in_window)
+        .all()
+    )
+    for key, moment, ingested_at, digest in rows:
+        aware = _aware(moment)
+        if aware is None:
+            continue
+        if key:
             snapshot.titles.add_anchors(str(key), aware, _aware(ingested_at) or now)
+        if digest:
+            snapshot.add_content(str(digest), aware)
+
+    # 已丢弃的记录没有 digest 列，只能按标题键参与判重（同名标题不会再进来）。
+    discarded = (
+        db.query(MarketNewsDiscard.title_key, MarketNewsDiscard.news_time, MarketNewsDiscard.discarded_at)
+        .filter(
+            MarketNewsDiscard.title_key != "",
+            MarketNewsDiscard.news_time.isnot(None),
+            or_(
+                and_(MarketNewsDiscard.news_time >= start, MarketNewsDiscard.news_time <= end),
+                and_(
+                    MarketNewsDiscard.discarded_at >= now - window,
+                    MarketNewsDiscard.discarded_at <= now + window,
+                ),
+            ),
+        )
+        .all()
+    )
+    for key, moment, ingested_at in discarded:
+        aware = _aware(moment)
+        if aware is None or not key:
+            continue
+        snapshot.titles.add_anchors(str(key), aware, _aware(ingested_at) or now)
     return snapshot
 
 
@@ -679,7 +739,7 @@ def insert_prepared_news(
     skipped: list[dict] = []
     for item, digest, digest_hash, url, news_time in prepared:
         title_key = news_title_key(digest)
-        if snapshot.blocked(digest_hash, url, title_key, news_time):
+        if snapshot.blocked(digest_hash, url, title_key, news_time, digest):
             skipped.append(item)
             continue
         rows.append(
@@ -689,7 +749,7 @@ def insert_prepared_news(
         )
         stamps.append(news_time)
         # 同批内重复：后到的直接判重，不必等 flush 撞唯一索引。
-        snapshot.add(digest_hash, url, title_key, news_time)
+        snapshot.add(digest_hash, url, title_key, news_time, digest)
     if not rows:
         return [], skipped
 

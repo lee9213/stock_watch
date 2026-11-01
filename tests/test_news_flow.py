@@ -1021,6 +1021,119 @@ def test_titles_similar_matches_real_duplicates_but_not_different_events():
         assert not titles_similar(news_title_key(a), news_title_key(b)), (a, b)
 
 
+def test_insert_news_batch_dedupes_rewritten_title_across_sources():
+    """多家改写同一事件：首句完全不同，标题判重放行，正文判重必须拦住。"""
+    from src.modules.market.news_store import insert_news_batch
+    from src.platform.persistence.news_keys import news_title_key, titles_similar
+
+    published = datetime(2026, 11, 1, 7, 50, tzinfo=SH)
+    first = (
+        "海洋王公告，公司股票在2026年10月19日至10月30日的10个交易日内收盘价涨幅偏离值"
+        "累计超过100%，构成严重异常波动；同时提示公司AI+智慧照明相关业务收入规模有限。"
+    )
+    second = (
+        "海洋王(002724.SZ)公告，股票连续10个交易日收盘价涨幅偏离值累计超100%，属严重异常"
+        "波动。公司澄清AI+智慧照明相关业务收入规模有限，对整体业绩尚不构成重大影响。"
+    )
+    # 前提：旧逻辑（只比首句）对这两条是无能为力的
+    assert not titles_similar(news_title_key(first), news_title_key(second))
+
+    db = _db()
+    created, skipped = insert_news_batch(db, [
+        {"digest": first, "news_time": published, "news_md5": "a" * 32, "sources": "cls"},
+        {
+            "digest": second,
+            "news_time": published + timedelta(minutes=5),
+            "news_md5": "b" * 32,
+            "url": "https://finance.eastmoney.com/x.html",
+            "sources": "eastmoney",
+        },
+    ])
+
+    assert len(created) == 1, "同一事件只应入库一条"
+    assert len(skipped) == 1
+    assert db.query(MarketNews).count() == 1
+
+
+def test_news_entities_recognizes_st_prefix_codes_and_ignores_macro_text():
+    """主体抽取只认高置信写法：抽错的代价是把两家公司的新闻合并掉。"""
+    from src.platform.persistence.news_keys import news_entities
+
+    samples = {
+        "海洋王(002724.SZ)公告，股票连续10个交易日收盘价涨幅偏离值累计超100%": {"海洋王", "002724"},
+        # ST / *ST 前缀含字母和星号，早期正则只认汉字，这两类全被漏掉
+        "ST合纵11月1日公告，公司于10月30日收到证监会立案告知书": {"ST合纵"},
+        "10月30日晚，*ST实达公告拟以现金收购福建省电子信息集团等7名股东持有的凯特科技股权": {"*ST实达"},
+        # 句首日期 / 媒体署名要先剥掉
+        "2026年11月1日，奥精医疗公告收到证监会《立案告知书》": {"奥精医疗"},
+        "财联社11月1日报道，奥精医疗(688613.SH)公告因涉嫌定期报告等财务数据虚假记载被立案调查": {
+            "奥精医疗",
+            "688613",
+        },
+        "11月1日，高争民爆披露重大资产重组预案，拟以发行股份方式购买紫源铜业51%股权": {"高争民爆"},
+    }
+    for text, expected in samples.items():
+        assert expected <= news_entities(text), (text, sorted(news_entities(text)))
+
+    # 宏观政策/海外新闻没有明确主体，不能硬凑一个出来
+    for text in (
+        "央行、金融监管总局、证监会将于11月2日召开会议，研究支持资本市场工具使用",
+        "证券时报获悉，11月2日央行、证监会将召集证券公司、基金公司开会",
+        "韩国10月出口额同比增长93.7%达创纪录的1153亿美元",
+    ):
+        assert news_entities(text) == frozenset(), (text, sorted(news_entities(text)))
+
+
+def test_contents_duplicate_respects_entity_boundary():
+    """正文相似度必须叠加主体约束，否则「同模板不同公司」会被误合并。"""
+    from src.platform.persistence.news_keys import content_signature, contents_duplicate
+
+    def judge(a: str, b: str) -> bool:
+        return contents_duplicate(content_signature(a), content_signature(b))
+
+    # 同一事件、改写后首句完全不同 → 靠正文判定
+    assert judge(
+        "海洋王公告，公司股票在2026年10月19日至10月30日的10个交易日内收盘价涨幅偏离值"
+        "累计超过100%，构成严重异常波动；同时提示公司AI+智慧照明相关业务收入规模有限。",
+        "海洋王(002724.SZ)公告，股票连续10个交易日收盘价涨幅偏离值累计超100%，属严重异常"
+        "波动。公司澄清AI+智慧照明相关业务收入规模有限，对整体业绩尚不构成重大影响。",
+    )
+    # 两条都是「XX公告10月销量同比下降X%」模板，相似度 0.29，但主体不同 → 必须放行
+    assert not judge(
+        "赛力斯公告2026年10月汽车销量27037辆，同比下降50.29%，产量同比下降52.34%，其中"
+        "新能源汽车销量24921辆，同比下降51.57%，本年累计销量同比下降21.48%。",
+        "上汽集团公告，2026年10月整车销量43万辆，同比下降5.28%，1-10月累计357.71万辆，"
+        "同比下降1.92%；10月新能源汽车销量25.86万辆，同比增长25.12%。",
+    )
+    # 同一主体 + 同一事件类型：文本相似度只有 0.18 也是同一件事。
+    # 「海洋王异常波动」这组四条两两相似度 0.18~0.43，单靠阈值要放到 0.18 才能抓全，
+    # 而那个区间会把同公司不同类型的公告卷进来，所以用事件类型补足。
+    assert judge(
+        "海洋王11月1日披露股票严重异常波动公告，称AI+智慧照明业务收入规模有限，且澄清"
+        "产品与核电、深海科技概念无关，表示股价已严重偏离基本面，存在回落风险。",
+        "海洋王公告，公司股票在2026年10月19日至10月30日的10个交易日内收盘价涨幅偏离值"
+        "累计超过100%，构成严重异常波动；同时提示公司AI+智慧照明相关业务收入规模有限。",
+    )
+    # 同主体但事件类型不同（回购 vs 中标），不能因为都提到公司名就合并
+    assert not judge(
+        "亨通光电公告称，董事长崔巍提议以不低于1亿元且不超过2亿元的自有或自筹资金回购公司股份",
+        "亨通光电中标中国移动2026年光缆集采项目，中标金额约12.6亿元，占上年营收的3.1%",
+    )
+    # 无主体的宏观新闻：相似度 0.53 才合并，不同事件（0.01）放行
+    assert judge(
+        "证券时报获悉，11月2日央行、证监会将召集证券公司、基金公司开会，研究推动支持资本"
+        "市场工具使用；同日央行、金融监管总局、证监会还将召集银行开会，研究优化股票回购"
+        "增持再贷款政策，释放稳市场信号。",
+        "券商中国报道，11月2日人民银行、证监会将召集券商、基金公司会议研究支持资本市场"
+        "工具使用，同日央行、金融监管总局、证监会召集银行会议研究优化股票回购增持再贷款"
+        "政策。",
+    )
+    assert not judge(
+        "央行、金融监管总局、证监会将于11月2日召开会议，研究支持资本市场工具使用",
+        "韩国10月出口额同比增长93.7%达创纪录的1153亿美元，其中半导体出口同比激增259%",
+    )
+
+
 def test_insert_news_skips_similar_title_within_window():
     db = _db()
     published = datetime(2026, 10, 30, 10, 0, tzinfo=SH)
